@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# bin/railsctl.d/config
+# Display resolved configuration parameters for global railsctl or a target service
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_common.sh"
+railsctl_load_global
+
+print_conf_keys() {
+  local conf_file="$1"
+  local key val
+  while IFS='=' read -r key _; do
+    [[ -n "${key}" ]] || continue
+    val="${!key-}"
+    printf '  %-24s = %s\n' "${key}" "${val}"
+  done < <(grep -E '^[A-Z0-9_]+=' "${conf_file}")
+}
+
+SERVICE="${1:-}"
+
+if [[ -z "${SERVICE}" ]]; then
+  CONF_PATH="${RAILSCTL_CONFIG_DIR}/railsctl.conf"
+  railsctl_status "Global Configuration (${CONF_PATH}):"
+  print_conf_keys "${CONF_PATH}"
+else
+  railsctl_load_service "${SERVICE}"
+  CONF_PATH="${RAILSCTL_CONFIG_DIR}/${SERVICE}.conf"
+  railsctl_status "Service Configuration: ${SERVICE_DISPLAY_NAME} (${CONF_PATH})"
+  print_conf_keys "${CONF_PATH}"
+fi

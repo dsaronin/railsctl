@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# bin/railsctl
+# Main command dispatcher for railsctl lifecycle and deployment suite
+
+set -euo pipefail
+
+# Resolve physical path through symlink (/home/<user>/bin/railsctl -> .../railsctl/bin/railsctl)
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SELF_DIR="$(dirname "${SELF_PATH}")"
+export RAILSCTL_ROOT="$(cd "${SELF_DIR}/.." && pwd)"
+
+# shellcheck source=/dev/null
+source "${RAILSCTL_ROOT}/bin/railsctl.d/_common.sh"
+railsctl_load_global
+
+railsctl_alert "railsctl v${RAILSCTL_VERSION} — starting"
+
+dispatch_cmd() {
+  local cmd="$1"
+  shift || true
+  local target="${RAILSCTL_COMMANDS_DIR}/${cmd}"
+
+  if [[ ! -x "${target}" ]]; then
+    railsctl_die "Command '${cmd}' is not yet implemented or not executable (${target})."
+  fi
+
+  "${target}" "$@"
+}
+
+# Handle zero arguments or top-level help/config invocations
+if [[ $# -eq 0 ]]; then
+  dispatch_cmd "help"
+  railsctl_alert "railsctl v${RAILSCTL_VERSION} — complete"
+  exit 0
+fi
+
+case "${1,,}" in
+  help|-h|--help)
+    shift
+    dispatch_cmd "help" "$@"
+    railsctl_alert "railsctl v${RAILSCTL_VERSION} — complete"
+    exit 0
+    ;;
+  config)
+    shift
+    dispatch_cmd "config" "$@"
+    railsctl_alert "railsctl v${RAILSCTL_VERSION} — complete"
+    exit 0
+    ;;
+esac
+
+# Standard invocation: railsctl <service> <command> [args...]
+SERVICE="${1:-}"
+COMMAND="${2:-}"
+
+if [[ -z "${COMMAND}" ]]; then
+  railsctl_die "Missing command for service '${SERVICE}'. Run 'railsctl help' for usage."
+fi
+
+shift 2
+CMD_NORM="${COMMAND,,}"
+
+case "${CMD_NORM}" in
+  deploy|start|stop|suspend|resume|backup|test|status|version|config|help)
+    dispatch_cmd "${CMD_NORM}" "${SERVICE}" "$@"
+    ;;
+  *)
+    railsctl_die "Unknown command '${COMMAND}'. Run 'railsctl help' for available commands."
+    ;;
+esac
+
+railsctl_alert "railsctl v${RAILSCTL_VERSION} — complete"
