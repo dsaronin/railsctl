@@ -1,0 +1,4 @@
+# Runtime logs and service state markers
+services/
+*~
+*.swp
