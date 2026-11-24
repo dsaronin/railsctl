@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# bin/railsctl.d/test
+# Execute the service test suite in isolation against a temporary SQLite copy
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_common.sh"
+railsctl_init required "$@"
+
+if [[ -z "${TEST_TEMP_DB:-}" ]]; then
+  railsctl_die "TEST_TEMP_DB is not configured for ${SERVICE_DISPLAY_NAME}."
+fi
+
+if [[ -z "${TEST_RUNNER:-}" ]]; then
+  railsctl_die "TEST_RUNNER is not configured for ${SERVICE_DISPLAY_NAME}."
+fi
+
+if ! sudo -u "${SERVICE_USER}" test -r "${ENV_FILE}"; then
+  railsctl_die "Environment file not readable by ${SERVICE_USER}: ${ENV_FILE}"
+fi
+
+db_source_mode=""
+db_source_path=""
+
+if [[ -n "${TEST_FIXTURE_DB:-}" ]] && sudo -u "${SERVICE_USER}" test -r "${TEST_FIXTURE_DB}"; then
+  db_source_mode="fixture"
+  db_source_path="${TEST_FIXTURE_DB}"
+elif [[ -n "${DB_PATH:-}" ]] && sudo -u "${SERVICE_USER}" test -r "${DB_PATH}"; then
+  db_source_mode="snapshot"
+  db_source_path="${DB_PATH}"
+  railsctl_warn "Fixture DB not found (${TEST_FIXTURE_DB:-unset}); falling back to online snapshot of ${DB_PATH}."
+else
+  railsctl_die "Neither TEST_FIXTURE_DB (${TEST_FIXTURE_DB:-unset}) nor DB_PATH (${DB_PATH:-unset}) is readable by ${SERVICE_USER}."
+fi
+
+railsctl_status "Running ${SERVICE_DISPLAY_NAME} test suite (${db_source_mode}: ${db_source_path})..."
+
+set +e
+sudo -u "${SERVICE_USER}" -H bash -s -- \
+  "${db_source_mode}" \
+  "${db_source_path}" \
+  "${TEST_TEMP_DB}" \
+  "${ENV_FILE}" \
+  "${RUBY_WRAPPER_DIR}" \
+  "${APP_DIR}" \
+  "${TEST_RUNNER}" <<'EOF'
+set -euo pipefail
+
+DB_MODE="$1"
+SOURCE_DB="$2"
+TEMP_DB="$3"
+ENV_FILE="$4"
+RUBY_WRAPPER_DIR="$5"
+APP_DIR="$6"
+TEST_RUNNER="$7"
+
+cleanup() {
+  rm -f "${TEMP_DB}"*
+}
+trap cleanup EXIT
+
+set -a
+# shellcheck source=/dev/null
+source "${ENV_FILE}"
+set +a
+
+export PATH="${RUBY_WRAPPER_DIR}:${PATH}"
+export DATABASE_PATH="${TEMP_DB}"
+export RAILS_SERVE_STATIC_FILES=true
+
+rm -f "${TEMP_DB}"*
+
+if [[ "${DB_MODE}" == "fixture" ]]; then
+  cp "${SOURCE_DB}" "${TEMP_DB}"
+else
+  sqlite3 "${SOURCE_DB}" ".backup '${TEMP_DB}'"
+fi
+
+cd "${APP_DIR}"
+bin/rails db:migrate
+"${TEST_RUNNER}"
+EOF
+rc=$?
+set -e
+
+if [[ ${rc} -eq 0 ]]; then
+  railsctl_status "${SERVICE_DISPLAY_NAME} test suite PASSED (exit ${rc})."
+  railsctl_log "TEST" "result=PASS exit=${rc} mode=${db_source_mode} source=${db_source_path}"
+else
+  railsctl_error "${SERVICE_DISPLAY_NAME} test suite FAILED (exit ${rc})."
+  railsctl_log "TEST" "result=FAIL exit=${rc} mode=${db_source_mode} source=${db_source_path}"
+fi
+
+exit "${rc}"

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# bin/railsctl.d/backup
+# Create a WAL-safe online SQLite snapshot and prune snapshots beyond BACKUP_RETENTION
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_common.sh"
+railsctl_init required "$@"
+
+retention="${BACKUP_RETENTION:-${DEFAULT_BACKUP_RETENTION}}"
+if [[ ! "${retention}" =~ ^[0-9]+$ || "${retention}" -lt 1 ]]; then
+  railsctl_die "Invalid BACKUP_RETENTION '${retention}' for ${SERVICE_DISPLAY_NAME}; must be a positive integer."
+fi
+
+if ! sudo -u "${SERVICE_USER}" test -r "${DB_PATH}"; then
+  railsctl_die "Source database not readable by ${SERVICE_USER}: ${DB_PATH}"
+fi
+
+sudo -u "${SERVICE_USER}" mkdir -p "${BACKUP_DIR}"
+
+timestamp="$(date +%Y%m%d_%H%M%S)"
+dest_file="${BACKUP_DIR}/${BACKUP_PREFIX}_${timestamp}.sqlite3"
+
+if sudo -u "${SERVICE_USER}" test -e "${dest_file}"; then
+  railsctl_die "Backup target already exists: ${dest_file}"
+fi
+
+railsctl_status "Creating online SQLite backup for ${SERVICE_DISPLAY_NAME}..."
+sudo -u "${SERVICE_USER}" sqlite3 "${DB_PATH}" ".backup '${dest_file}'"
+sudo -u "${SERVICE_USER}" chmod 0640 "${dest_file}"
+
+integrity="$(sudo -u "${SERVICE_USER}" sqlite3 "${dest_file}" "PRAGMA integrity_check;" 2>/dev/null || true)"
+if [[ "${integrity}" != "ok" ]]; then
+  sudo -u "${SERVICE_USER}" rm -f "${dest_file}"
+  railsctl_die "Backup integrity check failed for ${dest_file} (result: ${integrity:-empty})."
+fi
+
+backup_bytes="$(sudo -u "${SERVICE_USER}" stat -c '%s' "${dest_file}")"
+backup_size="$(awk -v b="${backup_bytes}" 'BEGIN {
+  if (b >= 1048576) printf "%.2f MiB", b / 1048576;
+  else if (b >= 1024) printf "%.1f KiB", b / 1024;
+  else printf "%d B", b;
+}')"
+
+railsctl_info "  Snapshot : ${dest_file} (${backup_size}, mode 0640, integrity ok)"
+
+mapfile -t snapshots < <(
+  sudo -u "${SERVICE_USER}" bash -c \
+    'shopt -s nullglob; ls -1t "$1"/"$2"_[0-9]*.sqlite3 2>/dev/null || true' \
+    _ "${BACKUP_DIR}" "${BACKUP_PREFIX}"
+)
+
+total_snapshots="${#snapshots[@]}"
+pruned_count=0
+
+if (( total_snapshots > retention )); then
+  for (( i = retention; i < total_snapshots; i++ )); do
+    old_file="${snapshots[$i]}"
+    sudo -u "${SERVICE_USER}" rm -f "${old_file}"
+    pruned_count=$(( pruned_count + 1 ))
+  done
+fi
+
+kept_count=$(( total_snapshots - pruned_count ))
+railsctl_info "  Retention: kept ${kept_count} of max ${retention} snapshot(s) (pruned ${pruned_count})"
+
+railsctl_log "BACKUP" "file=${dest_file} size=${backup_bytes}B kept=${kept_count} pruned=${pruned_count}"
