@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# bin/railsctl.d/status
+# Display runtime state, resource usage, maintenance mode, HTTP health, and release info
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_common.sh"
+railsctl_init optional "$@"
+
+format_uptime() {
+  local enter_ts="$1"
+  local enter_epoch now_epoch diff days hours mins secs
+
+  if [[ -z "${enter_ts}" || "${enter_ts}" == "n/a" ]]; then
+    printf 'N/A'
+    return 0
+  fi
+
+  enter_epoch="$(date -d "${enter_ts}" +%s 2>/dev/null || true)"
+  if [[ -z "${enter_epoch}" ]]; then
+    printf '%s' "${enter_ts}"
+    return 0
+  fi
+
+  now_epoch="$(date +%s)"
+  diff=$(( now_epoch - enter_epoch ))
+  (( diff < 0 )) && diff=0
+
+  days=$(( diff / 86400 ))
+  hours=$(( (diff % 86400) / 3600 ))
+  mins=$(( (diff % 3600) / 60 ))
+  secs=$(( diff % 60 ))
+
+  if (( days > 0 )); then
+    printf '%dd %dh %dm (since %s)' "${days}" "${hours}" "${mins}" "${enter_ts}"
+  elif (( hours > 0 )); then
+    printf '%dh %dm (since %s)' "${hours}" "${mins}" "${enter_ts}"
+  else
+    printf '%dm %ds (since %s)' "${mins}" "${secs}" "${enter_ts}"
+  fi
+}
+
+format_memory() {
+  local mem_bytes="$1"
+  if [[ -z "${mem_bytes}" || ! "${mem_bytes}" =~ ^[0-9]+$ || "${mem_bytes}" -eq 0 ]]; then
+    printf 'N/A'
+    return 0
+  fi
+  awk -v b="${mem_bytes}" 'BEGIN { printf "%.1f MiB", b / 1048576 }'
+}
+
+print_service_status() {
+  local svc="$1"
+  (
+    railsctl_load_service "${svc}"
+
+    local active_state="" sub_state="" main_pid="" mem_current="" enter_ts=""
+    local line key val
+    while IFS='=' read -r key val; do
+      case "${key}" in
+        ActiveState) active_state="${val}" ;;
+        SubState) sub_state="${val}" ;;
+        MainPID) main_pid="${val}" ;;
+        MemoryCurrent) mem_current="${val}" ;;
+        ActiveEnterTimestamp) enter_ts="${val}" ;;
+      esac
+    done < <(
+      systemctl show "${UNIT_NAME}" \
+        -p ActiveState -p SubState -p MainPID -p MemoryCurrent -p ActiveEnterTimestamp 2>/dev/null || true
+    )
+
+    active_state="${active_state:-unknown}"
+    sub_state="${sub_state:-unknown}"
+
+    local maint_enabled="false"
+    if [[ -n "${MAINTENANCE_FLAG:-}" ]] && sudo -u "${SERVICE_USER}" test -e "${MAINTENANCE_FLAG}" 2>/dev/null; then
+      maint_enabled="true"
+    fi
+
+    local overall_state maint_label pid_display mem_display uptime_display
+    if [[ "${maint_enabled}" == "true" && "${active_state}" != "active" ]]; then
+      overall_state="SUSPENDED (maintenance mode)"
+      maint_label="ENABLED (${MAINTENANCE_FLAG})"
+    elif [[ "${maint_enabled}" == "true" && "${active_state}" == "active" ]]; then
+      overall_state="MAINTENANCE (unit still active)"
+      maint_label="ENABLED (${MAINTENANCE_FLAG})"
+    elif [[ "${active_state}" == "active" ]]; then
+      overall_state="RUNNING"
+      maint_label="disabled"
+    elif [[ "${active_state}" == "failed" ]]; then
+      overall_state="FAILED"
+      maint_label="disabled"
+    else
+      overall_state="STOPPED"
+      maint_label="disabled"
+    fi
+
+    if [[ "${active_state}" == "active" ]]; then
+      pid_display="${main_pid:-N/A}"
+      mem_display="$(format_memory "${mem_current}")"
+      uptime_display="$(format_uptime "${enter_ts}")"
+    else
+      pid_display="N/A"
+      mem_display="N/A"
+      uptime_display="N/A"
+    fi
+
+    local http_code http_display
+    http_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "${BIND_URL}${HEALTH_PATH}" 2>/dev/null || true)"
+    http_code="${http_code:-000}"
+    if [[ "${http_code}" == "${HEALTH_EXPECTED_CODE}" ]]; then
+      http_display="HTTP ${http_code} (OK — ${BIND_URL}${HEALTH_PATH})"
+    elif [[ "${http_code}" == "000" && "${active_state}" != "active" ]]; then
+      http_display="unreachable (service not running)"
+    elif [[ "${http_code}" == "000" ]]; then
+      http_display="unreachable (${BIND_URL}${HEALTH_PATH})"
+    else
+      http_display="HTTP ${http_code} (expected ${HEALTH_EXPECTED_CODE} — ${BIND_URL}${HEALTH_PATH})"
+    fi
+
+    local app_version="N/A"
+    if [[ -n "${VERSION_FILE:-}" && -n "${VERSION_CONST:-}" ]] && sudo -u "${SERVICE_USER}" test -r "${VERSION_FILE}" 2>/dev/null; then
+      app_version="$(
+        sudo -u "${SERVICE_USER}" "${RUBY_WRAPPER_DIR}/ruby" \
+          -r"${VERSION_FILE}" \
+          -e "puts Object.const_get('${VERSION_CONST}')" 2>/dev/null || printf 'N/A'
+      )"
+    fi
+
+    local git_branch git_commit
+    git_branch="$(sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'N/A')"
+    git_commit="$(sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" log -1 --format='%h (%cs) %s' 2>/dev/null || printf 'N/A')"
+
+    railsctl_status "Service Status: ${SERVICE_DISPLAY_NAME} (${UNIT_NAME})"
+    railsctl_info "$(printf '  %-18s : %s' "Overall State" "${overall_state}")"
+    railsctl_info "$(printf '  %-18s : %s (%s)' "Systemd Unit" "${active_state}" "${sub_state}")"
+    railsctl_info "$(printf '  %-18s : %s' "Maintenance Mode" "${maint_label}")"
+    railsctl_info "$(printf '  %-18s : %s' "Main PID" "${pid_display}")"
+    railsctl_info "$(printf '  %-18s : %s' "Memory" "${mem_display}")"
+    railsctl_info "$(printf '  %-18s : %s' "Uptime" "${uptime_display}")"
+    railsctl_info "$(printf '  %-18s : %s' "HTTP Health" "${http_display}")"
+    if [[ "${app_version}" == "N/A" ]]; then
+      railsctl_info "$(printf '  %-18s : %s' "App Version" "N/A")"
+    else
+      railsctl_info "$(printf '  %-18s : v%s (%s)' "App Version" "${app_version}" "${VERSION_CONST}")"
+    fi
+    railsctl_info "$(printf '  %-18s : %s' "Git Branch" "${git_branch}")"
+    railsctl_info "$(printf '  %-18s : %s' "Git Commit" "${git_commit}")"
+
+    railsctl_log "STATUS" "state=${overall_state} unit=${active_state}/${sub_state} pid=${pid_display} http=${http_code} app=${app_version}"
+  )
+}
+
+if [[ -n "${SERVICE_NAME:-}" ]]; then
+  print_service_status "${SERVICE_NAME}"
+else
+  SERVICES="$(railsctl_list_services)"
+  if [[ -z "${SERVICES}" ]]; then
+    railsctl_warn "No configured services found."
+  else
+    first=1
+    while IFS= read -r svc; do
+      [[ -n "${svc}" ]] || continue
+      if [[ ${first} -eq 0 ]]; then
+        echo
+      fi
+      first=0
+      print_service_status "${svc}"
+    done <<< "${SERVICES}"
+  fi
+fi
