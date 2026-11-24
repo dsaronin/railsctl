@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# bin/railsctl.d/resume
+# Start the application service, verify HTTP health, and clear maintenance mode
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_common.sh"
+railsctl_init required "$@"
+
+railsctl_status "Resuming ${SERVICE_DISPLAY_NAME} from maintenance mode..."
+
+sudo systemctl start "${UNIT_NAME}"
+railsctl_wait_for_health
+
+if [[ -n "${MAINTENANCE_FLAG:-}" ]] && sudo -u "${SERVICE_USER}" test -e "${MAINTENANCE_FLAG}" 2>/dev/null; then
+  sudo -u "${SERVICE_USER}" rm -f "${MAINTENANCE_FLAG}"
+  railsctl_info "Maintenance flag removed (${MAINTENANCE_FLAG})."
+else
+  railsctl_info "Maintenance flag was already absent."
+fi
+
+railsctl_info "${SERVICE_DISPLAY_NAME} (${UNIT_NAME}) resumed and accepting traffic."
+railsctl_log "RESUME" "unit=${UNIT_NAME} health=ok"

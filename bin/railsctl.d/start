@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# bin/railsctl.d/start
+# Start the currently installed release and verify HTTP health check
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_common.sh"
+railsctl_init required "$@"
+
+railsctl_status "Starting ${SERVICE_DISPLAY_NAME} (${UNIT_NAME})..."
+sudo systemctl start "${UNIT_NAME}"
+
+railsctl_wait_for_health
+
+if [[ -n "${MAINTENANCE_FLAG:-}" ]] && sudo -u "${SERVICE_USER}" test -e "${MAINTENANCE_FLAG}" 2>/dev/null; then
+  railsctl_warn "Maintenance flag is still present (${MAINTENANCE_FLAG}); Nginx continues serving HTTP 503 until 'resume' is run."
+fi
+
+railsctl_info "${SERVICE_DISPLAY_NAME} (${UNIT_NAME}) is running."
+railsctl_log "START" "unit=${UNIT_NAME} health=ok"

@@ -119,3 +119,42 @@ railsctl_init() {
       ;;
   esac
 }
+
+
+###############################################################################
+# Health-check polling helper (shared by start, resume, deploy)
+###############################################################################
+railsctl_wait_for_health() {
+  local timeout="${HEALTH_TIMEOUT:-${DEFAULT_HEALTH_TIMEOUT:-15}}"
+  local interval="${HEALTH_INTERVAL:-${DEFAULT_HEALTH_INTERVAL:-1}}"
+  local journal_lines="${DEFAULT_JOURNAL_LINES:-40}"
+  local url="${BIND_URL}${HEALTH_PATH}"
+  local elapsed=0
+  local code="000"
+
+  railsctl_info "Waiting for health check ${url} (expecting HTTP ${HEALTH_EXPECTED_CODE}, timeout ${timeout}s)..."
+
+  while (( elapsed < timeout )); do
+    if ! systemctl is-active --quiet "${UNIT_NAME}"; then
+      railsctl_err "${UNIT_NAME} is not active while waiting for health check."
+      sudo journalctl -u "${UNIT_NAME}" -n "${journal_lines}" --no-pager >&2 || true
+      return 1
+    fi
+
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "${url}" 2>/dev/null || true)"
+    code="${code:-000}"
+    if [[ "${code}" == "${HEALTH_EXPECTED_CODE}" ]]; then
+      railsctl_info "Health check passed: HTTP ${code} (${url})"
+      return 0
+    fi
+
+    sleep "${interval}"
+    elapsed=$(( elapsed + interval ))
+  done
+
+  railsctl_err "Health check timed out after ${timeout}s (last HTTP ${code} from ${url})."
+  sudo journalctl -u "${UNIT_NAME}" -n "${journal_lines}" --no-pager >&2 || true
+  return 1
+}
+
+

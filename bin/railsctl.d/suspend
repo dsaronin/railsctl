@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# bin/railsctl.d/suspend
+# Enable Nginx 503 maintenance mode and stop the application service
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_common.sh"
+railsctl_init required "$@"
+
+if [[ -z "${MAINTENANCE_FLAG:-}" ]]; then
+  railsctl_die "MAINTENANCE_FLAG is not configured for ${SERVICE_DISPLAY_NAME}."
+fi
+
+railsctl_status "Suspending ${SERVICE_DISPLAY_NAME} into maintenance mode..."
+
+sudo -u "${SERVICE_USER}" mkdir -p "$(dirname "${MAINTENANCE_FLAG}")"
+sudo -u "${SERVICE_USER}" touch "${MAINTENANCE_FLAG}"
+
+if [[ -n "${MAINTENANCE_HTML:-}" ]] && sudo -u "${SERVICE_USER}" test -r "${MAINTENANCE_HTML}" 2>/dev/null; then
+  railsctl_info "Maintenance flag active (${MAINTENANCE_FLAG}); serving ${MAINTENANCE_HTML} (HTTP 503)."
+else
+  railsctl_info "Maintenance flag active (${MAINTENANCE_FLAG}); serving default plain-text HTTP 503."
+fi
+
+if systemctl is-active --quiet "${UNIT_NAME}"; then
+  sudo systemctl stop "${UNIT_NAME}"
+  railsctl_info "${SERVICE_DISPLAY_NAME} (${UNIT_NAME}) stopped."
+else
+  railsctl_warn "${SERVICE_DISPLAY_NAME} (${UNIT_NAME}) was already stopped."
+fi
+
+railsctl_log "SUSPEND" "unit=${UNIT_NAME} flag=${MAINTENANCE_FLAG}"
