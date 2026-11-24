@@ -91,3 +91,31 @@ railsctl_log() {
   ts="$(date '+%Y-%m-%d %H:%M:%S %Z')"
   printf '%s | %-8s | %s\n' "${ts}" "${action}" "${message}" >> "${log_dir}/railsctl.log"
 }
+
+
+railsctl_init() {
+  local mode="${1:-required}"
+  shift || true
+
+  railsctl_load_global
+
+  case "${mode}" in
+    required)
+      if [[ $# -ne 1 ]]; then
+        railsctl_die "Expected exactly 1 argument (<service>), got $#."
+      fi
+      railsctl_load_service "$1"
+      ;;
+    optional)
+      if [[ $# -gt 1 ]]; then
+        railsctl_die "Expected at most 1 argument ([service]), got $#."
+      fi
+      if [[ $# -eq 1 ]]; then
+        railsctl_load_service "$1"
+      fi
+      ;;
+    *)
+      railsctl_die "Internal error: unknown railsctl_init mode '${mode}'."
+      ;;
+  esac
+}

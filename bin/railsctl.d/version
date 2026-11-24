@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# bin/railsctl.d/version
+# Display railsctl suite version, service application version, and deployed Git commit
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_common.sh"
+railsctl_init optional "$@"
+
+print_service_version() {
+  local svc="$1"
+  (
+    railsctl_load_service "${svc}"
+
+    local app_version="N/A"
+    if [[ -n "${VERSION_FILE:-}" && -n "${VERSION_CONST:-}" ]] && sudo -u "${SERVICE_USER}" test -r "${VERSION_FILE}"; then
+      app_version="$(
+        sudo -u "${SERVICE_USER}" "${RUBY_WRAPPER_DIR}/ruby" \
+          -r"${VERSION_FILE}" \
+          -e "puts Object.const_get('${VERSION_CONST}')" 2>/dev/null || printf 'N/A'
+      )"
+    fi
+
+    local git_sha git_branch
+    git_sha="$(sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" rev-parse --short HEAD 2>/dev/null || printf 'N/A')"
+    git_branch="$(sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'N/A')"
+
+    if [[ "${app_version}" == "N/A" ]]; then
+      railsctl_info "$(printf '  %-18s : %s (git: %s %s)' "${SERVICE_DISPLAY_NAME}" "N/A" "${git_sha}" "${git_branch}")"
+    else
+      railsctl_info "$(printf '  %-18s : v%s [%s] (git: %s %s)' "${SERVICE_DISPLAY_NAME}" "${app_version}" "${VERSION_CONST}" "${git_sha}" "${git_branch}")"
+    fi
+
+    railsctl_log "VERSION" "railsctl=v${RAILSCTL_VERSION} app=${app_version} git=${git_sha} (${git_branch})"
+  )
+}
+
+railsctl_status "Version Info:"
+railsctl_info "$(printf '  %-18s : v%s' "railsctl" "${RAILSCTL_VERSION}")"
+
+if [[ -n "${SERVICE_NAME:-}" ]]; then
+  print_service_version "${SERVICE_NAME}"
+else
+  SERVICES="$(railsctl_list_services)"
+  if [[ -z "${SERVICES}" ]]; then
+    railsctl_info "  No configured services found."
+  else
+    while IFS= read -r svc; do
+      [[ -n "${svc}" ]] || continue
+      print_service_version "${svc}"
+    done <<< "${SERVICES}"
+  fi
+fi
