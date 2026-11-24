@@ -12,7 +12,7 @@ railsctl_load_global
 SERVICES_LIST="$(railsctl_list_services | paste -sd ', ' -)"
 
 railsctl_status "Usage:"
-railsctl_info   "  railsctl <service> <command>"
+railsctl_info   "  railsctl <service> <command> [options]"
 railsctl_info   "  railsctl config [service]"
 railsctl_info   "  railsctl help"
 echo
@@ -23,7 +23,8 @@ echo
 
 railsctl_status "Lifecycle & Deployment Commands:"
 cat <<'EOF'
-  deploy    Backup DB, pull fast-forward, bundle, migrate, precompile assets, restart & verify
+  deploy    Suspend, backup DB, pull fast-forward, bundle, migrate, precompile, resume & status 
+            [--dry-run] [--redeploy] [--no-backup]
   start     Start the systemd unit and verify the HTTP health check
   stop      Cleanly stop the systemd unit
   suspend   Enable Nginx 503 maintenance mode and stop Puma

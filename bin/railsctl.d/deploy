@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# bin/railsctl.d/deploy
+# Phase 1: Flag parsing, pre-flight verification, and remote Git fetch
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_common.sh"
+
+###############################################################################
+# State initialization
+###############################################################################
+deploy_reset_variables() {
+  OPT_DRY_RUN=false
+  OPT_REDEPLOY=false
+  OPT_NO_BACKUP=false
+
+  PREV_COMMIT=""
+  TARGET_COMMIT=""
+  SNAPSHOT_FILE=""
+  NEW_COMMIT=""
+}
+
+###############################################################################
+# Phase 1 helper functions
+###############################################################################
+deploy_parse_args() {
+  railsctl_parse_args --dry-run --redeploy --no-backup -- "$@"
+
+  railsctl_info "Deploy flags: dry-run=${OPT_DRY_RUN}, redeploy=${OPT_REDEPLOY}, no-backup=${OPT_NO_BACKUP}"
+  railsctl_log "DEPLOY" "phase=1_flags dry_run=${OPT_DRY_RUN} redeploy=${OPT_REDEPLOY} no_backup=${OPT_NO_BACKUP}"
+}
+
+deploy_check_env_file() {
+  if ! sudo -u "${SERVICE_USER}" test -r "${ENV_FILE}"; then
+    railsctl_log "DEPLOY" "phase=1_preflight check=env_file status=FAIL path=${ENV_FILE}"
+    railsctl_die "Environment file not readable by ${SERVICE_USER}: ${ENV_FILE}"
+  fi
+
+  railsctl_info "  Verified ENV_FILE readable: ${ENV_FILE}"
+  railsctl_log "DEPLOY" "phase=1_preflight check=env_file status=OK path=${ENV_FILE}"
+}
+
+deploy_check_git_clean() {
+  if ! sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    railsctl_log "DEPLOY" "phase=1_preflight check=git_repo status=FAIL path=${APP_DIR}"
+    railsctl_die "Application directory is not a valid Git repository: ${APP_DIR}"
+  fi
+
+  local dirty_files
+  dirty_files="$(sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" status --porcelain)"
+  if [[ -n "${dirty_files}" ]]; then
+    railsctl_log "DEPLOY" "phase=1_preflight check=git_worktree status=DIRTY path=${APP_DIR}"
+    railsctl_err "Uncommitted changes detected in ${APP_DIR}:"
+    railsctl_err "${dirty_files}"
+    railsctl_die "Aborting deploy: working tree must be clean before deploying."
+  fi
+
+  railsctl_info "  Verified clean Git working tree: ${APP_DIR}"
+  railsctl_log "DEPLOY" "phase=1_preflight check=git_worktree status=CLEAN path=${APP_DIR}"
+}
+
+deploy_fetch_and_resolve_commits() {
+  railsctl_info "  Fetching remote '${GIT_REMOTE}' (branch '${GIT_BRANCH}')..."
+  sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" fetch "${GIT_REMOTE}"
+  railsctl_log "DEPLOY" "phase=1_preflight check=git_fetch status=OK remote=${GIT_REMOTE}"
+
+  PREV_COMMIT="$(sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" rev-parse HEAD)"
+  TARGET_COMMIT="$(sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" rev-parse "${GIT_REMOTE}/${GIT_BRANCH}")"
+
+  railsctl_info "  Current HEAD    : ${PREV_COMMIT:0:7} (${PREV_COMMIT})"
+  railsctl_info "  Target Remote   : ${TARGET_COMMIT:0:7} (${GIT_REMOTE}/${GIT_BRANCH})"
+  railsctl_log "DEPLOY" "phase=1_preflight check=commits head=${PREV_COMMIT:0:7} target=${TARGET_COMMIT:0:7}"
+}
+
+deploy_handle_dry_run() {
+  railsctl_status "Dry-run active: no changes will be applied."
+  if [[ "${PREV_COMMIT}" != "${TARGET_COMMIT}" ]]; then
+    railsctl_info "Incoming commits (${PREV_COMMIT:0:7}..${TARGET_COMMIT:0:7}):"
+    sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" log --oneline "${PREV_COMMIT}..${TARGET_COMMIT}"
+  else
+    railsctl_info "Incoming commits: none (--redeploy specified on ${PREV_COMMIT:0:7})."
+  fi
+  railsctl_log "DEPLOY" "phase=1_complete status=DRY_RUN head=${PREV_COMMIT:0:7} target=${TARGET_COMMIT:0:7}"
+}
+
+deploy_preflight() {
+  railsctl_status "Phase 1: Running pre-flight checks for ${SERVICE_DISPLAY_NAME}..."
+
+  deploy_check_env_file
+  deploy_check_git_clean
+  deploy_fetch_and_resolve_commits
+
+  if [[ "${PREV_COMMIT}" == "${TARGET_COMMIT}" ]] && [[ "${OPT_REDEPLOY}" != "true" ]]; then
+    railsctl_info "${SERVICE_DISPLAY_NAME} is already up to date at ${PREV_COMMIT:0:7} (use --redeploy to force)."
+    railsctl_log "DEPLOY" "phase=1_complete status=UP_TO_DATE commit=${PREV_COMMIT:0:7}"
+    return 10
+  fi
+
+  if [[ "${OPT_DRY_RUN}" == "true" ]]; then
+    deploy_handle_dry_run
+    return 11
+  fi
+
+  railsctl_log "DEPLOY" "phase=1_complete status=READY_FOR_PHASE_2 head=${PREV_COMMIT:0:7} target=${TARGET_COMMIT:0:7}"
+  return 0
+}
+
+###############################################################################
+# Phase 2 helper functions & failure diagnostics
+###############################################################################
+deploy_report_failure() {
+  local failed_phase="$1"
+
+  case "${failed_phase}" in
+    SUSPEND)
+      railsctl_log "DEPLOY" "phase=2_suspend status=FAIL unit=${UNIT_NAME}"
+      railsctl_err "Deployment aborted during Phase 2 (SUSPEND)."
+      railsctl_err "System state: ${MAINTENANCE_FLAG} may exist and ${UNIT_NAME} state may be uncertain."
+      railsctl_err "Recovery steps:"
+      railsctl_err "  1. Inspect state : railsctl ${SERVICE_NAME} status"
+      railsctl_err "  2. Restore service: railsctl ${SERVICE_NAME} resume"
+      ;;
+    BACKUP)
+      railsctl_log "DEPLOY" "phase=3_backup status=FAIL db=${DB_PATH}"
+      railsctl_err "Deployment aborted during Phase 3 (BACKUP)."
+      railsctl_err "System state: SUSPENDED (HTTP 503); code and database are untouched."
+      railsctl_err "Recovery steps:"
+      railsctl_err "  1. Resolve backup issue in ${BACKUP_DIR} and re-run deploy, or"
+      railsctl_err "  2. Restore service immediately: railsctl ${SERVICE_NAME} resume"
+      ;;
+    BUILD)
+      local failed_step="${2:-unknown}"
+      railsctl_log "DEPLOY" "phase=4_build status=FAIL step=${failed_step} prev_commit=${PREV_COMMIT:0:7}"
+      railsctl_err "Deployment aborted during Phase 4 (BUILD step: ${failed_step})."
+      railsctl_err "System state: SUSPENDED (HTTP 503); ${UNIT_NAME} remains stopped."
+      railsctl_err "Rollback steps:"
+      railsctl_err "  1. Revert code     : sudo -u ${SERVICE_USER} git -C ${APP_DIR} reset --hard ${PREV_COMMIT}"
+      if [[ -n "${SNAPSHOT_FILE}" ]]; then
+        railsctl_err "  2. Restore DB (if migrated): sudo -u ${SERVICE_USER} cp -p ${SNAPSHOT_FILE} ${DB_PATH} && sudo -u ${SERVICE_USER} rm -f ${DB_PATH}-wal ${DB_PATH}-shm"
+      else
+        railsctl_err "  2. Restore DB      : no snapshot taken (--no-backup was specified)"
+      fi
+      railsctl_err "  3. Resume service  : railsctl ${SERVICE_NAME} resume"
+      ;;
+    RESUME)
+      railsctl_log "DEPLOY" "phase=5_resume status=FAIL unit=${UNIT_NAME} prev_commit=${PREV_COMMIT:0:7}"
+      railsctl_err "Deployment aborted during Phase 5 (RESUME / health check)."
+      railsctl_err "System state: ${MAINTENANCE_FLAG} remains active (HTTP 503); ${UNIT_NAME} failed health check."
+      railsctl_err "Rollback steps (if new release is faulty):"
+      railsctl_err "  1. Stop service    : railsctl ${SERVICE_NAME} stop"
+      railsctl_err "  2. Revert code     : sudo -u ${SERVICE_USER} git -C ${APP_DIR} reset --hard ${PREV_COMMIT}"
+      if [[ -n "${SNAPSHOT_FILE}" ]]; then
+        railsctl_err "  3. Restore DB      : sudo -u ${SERVICE_USER} cp -p ${SNAPSHOT_FILE} ${DB_PATH} && sudo -u ${SERVICE_USER} rm -f ${DB_PATH}-wal ${DB_PATH}-shm"
+      else
+        railsctl_err "  3. Restore DB      : no snapshot taken (--no-backup was specified)"
+      fi
+      railsctl_err "  4. Resume service  : railsctl ${SERVICE_NAME} resume"
+      ;;
+    *)
+      railsctl_err "Deployment failed in phase '${failed_phase}'."
+      ;;
+  esac
+}
+
+deploy_suspend() {
+  railsctl_status "Phase 2: Suspending ${SERVICE_DISPLAY_NAME} into maintenance mode..."
+  railsctl_log "DEPLOY" "phase=2_suspend status=START unit=${UNIT_NAME}"
+
+  local suspend_rc=0
+  set +e
+  "${RAILSCTL_COMMANDS_DIR}/suspend" "${SERVICE_NAME}"
+  suspend_rc=$?
+  set -e
+
+  if [[ ${suspend_rc} -ne 0 ]]; then
+    deploy_report_failure "SUSPEND"
+    return "${suspend_rc}"
+  fi
+
+  railsctl_log "DEPLOY" "phase=2_suspend status=OK flag=${MAINTENANCE_FLAG}"
+}
+
+deploy_backup() {
+  if [[ "${OPT_NO_BACKUP}" == "true" ]]; then
+    railsctl_status "Phase 3: Skipping database backup (--no-backup specified)."
+    railsctl_log "DEPLOY" "phase=3_backup status=SKIPPED reason=no_backup_flag"
+    return 0
+  fi
+
+  railsctl_status "Phase 3: Creating quiescent database snapshot for ${SERVICE_DISPLAY_NAME}..."
+  railsctl_log "DEPLOY" "phase=3_backup status=START db=${DB_PATH}"
+
+  local backup_rc=0
+  set +e
+  "${RAILSCTL_COMMANDS_DIR}/backup" "${SERVICE_NAME}"
+  backup_rc=$?
+  set -e
+
+  if [[ ${backup_rc} -ne 0 ]]; then
+    deploy_report_failure "BACKUP"
+    return "${backup_rc}"
+  fi
+
+  SNAPSHOT_FILE="$(sudo -u "${SERVICE_USER}" find "${BACKUP_DIR}" -maxdepth 1 -type f -name "${BACKUP_PREFIX}_*.sqlite3" | sort | tail -n 1)"
+  if [[ -z "${SNAPSHOT_FILE}" ]] || ! sudo -u "${SERVICE_USER}" test -r "${SNAPSHOT_FILE}"; then
+    deploy_report_failure "BACKUP"
+    railsctl_die "Backup command exited 0, but snapshot file could not be verified in ${BACKUP_DIR}."
+  fi
+
+  railsctl_info "  Verified quiescent snapshot: ${SNAPSHOT_FILE}"
+  railsctl_log "DEPLOY" "phase=3_backup status=OK snapshot=${SNAPSHOT_FILE}"
+}
+
+###############################################################################
+# Phase 4 helper functions (code update, bundle, migrate, assets)
+###############################################################################
+deploy_run_as_service_user() {
+  local cmd_str="$1"
+  sudo -u "${SERVICE_USER}" -H bash -c '
+    set -euo pipefail
+    set -a
+    source "$1"
+    set +a
+    export PATH="$2:$PATH"
+    cd "$3"
+    eval "$4"
+  ' -- "${ENV_FILE}" "${RUBY_WRAPPER_DIR}" "${APP_DIR}" "${cmd_str}"
+}
+
+deploy_git_pull() {
+  railsctl_info "  Pulling fast-forward (${GIT_REMOTE}/${GIT_BRANCH})..."
+  railsctl_log "DEPLOY" "phase=4_build step=git_pull status=START remote=${GIT_REMOTE} branch=${GIT_BRANCH}"
+
+  if ! sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" pull --ff-only "${GIT_REMOTE}" "${GIT_BRANCH}"; then
+    deploy_report_failure "BUILD" "git_pull"
+    return 1
+  fi
+
+  local head_after
+  head_after="$(sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" rev-parse HEAD)"
+  railsctl_log "DEPLOY" "phase=4_build step=git_pull status=OK head=${head_after:0:7}"
+}
+
+deploy_bundle_install() {
+  railsctl_info "  Installing gems (without '${BUNDLE_WITHOUT}', jobs=${BUNDLE_JOBS})..."
+  railsctl_log "DEPLOY" "phase=4_build step=bundle_install status=START jobs=${BUNDLE_JOBS}"
+
+  local bundle_cmd="bundle config set --local path vendor/bundle && bundle config set --local without '${BUNDLE_WITHOUT}' && bundle install --jobs '${BUNDLE_JOBS}'"
+  if ! deploy_run_as_service_user "${bundle_cmd}"; then
+    deploy_report_failure "BUILD" "bundle_install"
+    return 1
+  fi
+
+  railsctl_log "DEPLOY" "phase=4_build step=bundle_install status=OK"
+}
+
+deploy_db_migrate() {
+  railsctl_info "  Running database migrations (bin/rails db:migrate)..."
+  railsctl_log "DEPLOY" "phase=4_build step=db_migrate status=START"
+
+  if ! deploy_run_as_service_user "bundle exec rails db:migrate"; then
+    deploy_report_failure "BUILD" "db_migrate"
+    return 1
+  fi
+
+  railsctl_log "DEPLOY" "phase=4_build step=db_migrate status=OK"
+}
+
+deploy_assets_precompile() {
+  railsctl_info "  Precompiling assets (bin/rails assets:precompile)..."
+  railsctl_log "DEPLOY" "phase=4_build step=assets_precompile status=START"
+
+  if ! deploy_run_as_service_user "bundle exec rails assets:precompile"; then
+    deploy_report_failure "BUILD" "assets_precompile"
+    return 1
+  fi
+
+  railsctl_log "DEPLOY" "phase=4_build step=assets_precompile status=OK"
+}
+
+deploy_build() {
+  railsctl_status "Phase 4: Updating code, dependencies, schema, and assets..."
+
+  deploy_git_pull
+  deploy_bundle_install
+  deploy_db_migrate
+  deploy_assets_precompile
+}
+
+###############################################################################
+# Phase 5 helper functions (resume service & verify HTTP health)
+###############################################################################
+deploy_resume() {
+  railsctl_status "Phase 5: Resuming ${SERVICE_DISPLAY_NAME} and verifying health..."
+  railsctl_log "DEPLOY" "phase=5_resume status=START unit=${UNIT_NAME}"
+
+  local resume_rc=0
+  set +e
+  "${RAILSCTL_COMMANDS_DIR}/resume" "${SERVICE_NAME}"
+  resume_rc=$?
+  set -e
+
+  if [[ ${resume_rc} -ne 0 ]]; then
+    deploy_report_failure "RESUME"
+    return "${resume_rc}"
+  fi
+
+  NEW_COMMIT="$(sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" rev-parse HEAD)"
+  railsctl_log "DEPLOY" "phase=5_resume status=OK prev_commit=${PREV_COMMIT:0:7} new_commit=${NEW_COMMIT:0:7}"
+}
+
+###############################################################################
+# Phase 6 helper functions (post-deploy status & final audit)
+###############################################################################
+deploy_report_status() {
+  railsctl_status "Phase 6: Reporting post-deploy status for ${SERVICE_DISPLAY_NAME}..."
+  railsctl_log "DEPLOY" "phase=6_status status=START unit=${UNIT_NAME}"
+
+  local status_rc=0
+  set +e
+  "${RAILSCTL_COMMANDS_DIR}/status" "${SERVICE_NAME}"
+  status_rc=$?
+  set -e
+
+  if [[ ${status_rc} -ne 0 ]]; then
+    railsctl_warn "Phase 6 status subcommand exited ${status_rc}; run 'railsctl ${SERVICE_NAME} status' manually to inspect."
+    railsctl_log "DEPLOY" "phase=6_status status=WARN exit=${status_rc}"
+    return 0
+  fi
+
+  railsctl_log "DEPLOY" "phase=6_status status=OK prev_commit=${PREV_COMMIT:0:7} new_commit=${NEW_COMMIT:0:7}"
+}
+
+###############################################################################
+# Main logic for DEPLOY
+###############################################################################
+deploy_main() {
+  deploy_reset_variables
+
+  if [[ $# -lt 1 ]]; then
+    railsctl_init required
+  fi
+
+  local service_arg="$1"
+  shift 1
+  railsctl_init required "${service_arg}"
+
+  deploy_parse_args "$@"
+
+  local preflight_rc=0
+  set +e
+  deploy_preflight
+  preflight_rc=$?
+  set -e
+
+  case ${preflight_rc} in
+    0)
+      railsctl_info "Phase 1 complete: pre-flight passed."
+      ;;
+    10|11)
+      return 0
+      ;;
+    *)
+      return "${preflight_rc}"
+      ;;
+  esac
+
+  deploy_suspend
+  railsctl_log "DEPLOY" "phase=2_complete status=READY_FOR_PHASE_3 head=${PREV_COMMIT:0:7} target=${TARGET_COMMIT:0:7}"
+
+  deploy_backup
+  railsctl_log "DEPLOY" "phase=3_complete status=READY_FOR_PHASE_4 snapshot=${SNAPSHOT_FILE:-none}"
+
+  deploy_build
+  railsctl_log "DEPLOY" "phase=4_complete status=READY_FOR_PHASE_5 head=${PREV_COMMIT:0:7} target=${TARGET_COMMIT:0:7}"
+
+  deploy_resume
+  railsctl_log "DEPLOY" "phase=5_complete status=READY_FOR_PHASE_6 prev_commit=${PREV_COMMIT:0:7} new_commit=${NEW_COMMIT:0:7}"
+
+  deploy_report_status
+  railsctl_log "DEPLOY" "status=COMPLETE prev_commit=${PREV_COMMIT:0:7} new_commit=${NEW_COMMIT:0:7} snapshot=${SNAPSHOT_FILE:-none}"
+
+  railsctl_info "Deployment complete (${PREV_COMMIT:0:7} -> ${NEW_COMMIT:0:7})."
+}
+
+###############################################################################
+# Main entry point for DEPLOY
+###############################################################################
+deploy_main "$@"
+

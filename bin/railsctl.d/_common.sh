@@ -157,4 +157,41 @@ railsctl_wait_for_health() {
   return 1
 }
 
+###############################################################################
+# Reusable CLI boolean flag parser
+# Usage: railsctl_parse_args --flag-one --flag-two -- "$@"
+# Sets OPT_FLAG_ONE=true, OPT_FLAG_TWO=true for matched flags.
+###############################################################################
+railsctl_parse_args() {
+  local allowed_flags=()
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--" ]]; then
+      shift
+      break
+    fi
+    allowed_flags+=("$1")
+    shift
+  done
+
+  local arg allowed valid var_name
+  for arg in "$@"; do
+    valid=false
+    for allowed in "${allowed_flags[@]}"; do
+      if [[ "${arg}" == "${allowed}" ]]; then
+        valid=true
+        break
+      fi
+    done
+
+    if [[ "${valid}" != "true" ]]; then
+      railsctl_die "Unknown option '${arg}'. Supported flags: ${allowed_flags[*]}"
+    fi
+
+    var_name="OPT_${arg#--}"
+    var_name="${var_name//-/_}"
+    var_name="${var_name^^}"
+    # local assignment follows
+    printf -v "${var_name}" '%s' "true"
+  done
+}
 

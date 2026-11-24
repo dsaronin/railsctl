@@ -1,5 +1,59 @@
 # railsctl
 
+## Usage
+
+```bash
+railsctl <service> <command> [options]
+railsctl <command> <service> [options]
+railsctl config [service]
+railsctl help
+```
+
+### Configured Services
+
+Services are registered under `services/<service>/service.conf` (for example, `gallery`).
+
+### Lifecycle & Deployment Commands
+
+| Command | Description |
+| :--- | :--- |
+| `deploy` | Suspend service, create a quiescent SQLite backup, pull fast-forward (`--ff-only`), install gems, run migrations, precompile assets, resume service, and report status. |
+| `start` | Start the systemd unit and verify the HTTP health check. |
+| `stop` | Cleanly stop the systemd unit. |
+| `suspend` | Enable Nginx `503` maintenance mode and stop Puma. |
+| `resume` | Start Puma, verify the HTTP health check, and clear maintenance mode. |
+| `backup` | Create a WAL-safe online SQLite backup and prune older snapshots beyond retention limits. |
+| `test` | Run the isolated test suite against a temporary snapshot database. |
+| `status` | Display systemd state, PID, memory, uptime, HTTP health, Git commit, and app version. |
+| `version` | Display `railsctl` version, service app version constant, and Git SHA. |
+| `config` | Display resolved configuration parameters for `<service>` or global `railsctl` settings. |
+| `help` | Display usage syntax, configured services, and available commands. |
+
+### `deploy` Options
+
+| Option | Behavior |
+| :--- | :--- |
+| `--dry-run` | Run pre-flight checks and `git fetch`, display incoming commits, and exit without modifying code, database, or service state. |
+| `--redeploy` | Execute the full 6-phase deployment pipeline even when `HEAD` already matches `<remote>/<branch>`. |
+| `--no-backup` | Skip the quiescent SQLite snapshot step after suspending the service. |
+
+### Examples
+
+```bash
+# Preview incoming commits without modifying the running service
+railsctl gallery deploy --dry-run
+
+# Deploy new commits from the configured remote branch
+railsctl gallery deploy
+
+# Force a full redeploy on the current commit without creating a new backup
+railsctl gallery deploy --redeploy --no-backup
+
+# Inspect runtime status and resolved configuration
+railsctl gallery status
+railsctl config gallery
+```
+
 ## Project Summary & Proposal
 
 ### Objective
