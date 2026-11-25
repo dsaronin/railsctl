@@ -61,16 +61,46 @@ init_on_err() {
   exit "${err_rc}"
 }
 
+init_rollback_phase_2() {
+  if [[ "${CREATED_HOME}" == "true" ]] && [[ -n "${INIT_SERVICE_HOME}" ]] && [[ "${INIT_SERVICE_HOME}" == /home/* ]]; then
+    railsctl_warn "  Rollback: removing directory tree ${INIT_SERVICE_HOME}..."
+    sudo rm -rf "${INIT_SERVICE_HOME}"
+    CREATED_HOME=false
+  fi
+
+  local entry member grp
+  for entry in "${ADDED_GROUP_MEMBERS[@]}"; do
+    member="${entry%%:*}"
+    grp="${entry#*:}"
+    railsctl_warn "  Rollback: removing '${member}' from group '${grp}'..."
+    sudo gpasswd -d "${member}" "${grp}" >/dev/null 2>&1 || true
+  done
+  ADDED_GROUP_MEMBERS=()
+
+  if [[ "${CREATED_USER}" == "true" ]] && id -u "${INIT_SERVICE_USER}" >/dev/null 2>&1; then
+    railsctl_warn "  Rollback: deleting system user '${INIT_SERVICE_USER}'..."
+    sudo userdel "${INIT_SERVICE_USER}" >/dev/null 2>&1 || true
+    CREATED_USER=false
+  fi
+
+  if [[ "${CREATED_GROUP}" == "true" ]] && getent group "${INIT_SERVICE_GROUP}" >/dev/null 2>&1; then
+    railsctl_warn "  Rollback: deleting system group '${INIT_SERVICE_GROUP}'..."
+    sudo groupdel "${INIT_SERVICE_GROUP}" >/dev/null 2>&1 || true
+    CREATED_GROUP=false
+  fi
+}
+
 init_rollback() {
   ROLLBACK_IN_PROGRESS=true
   set +e
 
   railsctl_warn "Rollback: reverting artifacts created during this init run..."
-  # Reverse-order teardown steps will be populated in Phases 2-5:
-  #   1. Nginx (CREATED_NGINX_ENABLED, CREATED_NGINX_AVAIL)
-  #   2. Systemd (CREATED_SYSTEMD)
-  #   3. railsctl registration (CREATED_CONF, CREATED_LOG_DIR)
-  #   4. Filesystem & OS user/group (CREATED_HOME, ADDED_GROUP_MEMBERS, CREATED_USER, CREATED_GROUP)
+  # Reverse-order teardown steps:
+  #   1. Nginx (Phase 5)
+  #   2. Systemd (Phase 5)
+  #   3. railsctl registration (Phase 4)
+  #   4. Filesystem & OS user/group (Phase 2)
+  init_rollback_phase_2
 
   railsctl_warn "Rollback complete."
   ROLLBACK_ARMED=false
@@ -316,6 +346,106 @@ init_preflight() {
 }
 
 ###############################################################################
+# Phase 2: OS user, group & directory skeleton
+###############################################################################
+init_add_user_to_group_if_missing() {
+  local member="$1"
+  local grp="$2"
+
+  if ! id -u "${member}" >/dev/null 2>&1; then
+    railsctl_die "Cannot add non-existent user '${member}' to group '${grp}'."
+  fi
+  if ! getent group "${grp}" >/dev/null 2>&1; then
+    railsctl_die "Cannot add '${member}' to non-existent group '${grp}'."
+  fi
+
+  if id -nG "${member}" | tr ' ' '\n' | grep -Fxq "${grp}"; then
+    railsctl_info "  User '${member}' is already a member of '${grp}'."
+    return 0
+  fi
+
+  sudo usermod -aG "${grp}" "${member}"
+  ADDED_GROUP_MEMBERS+=("${member}:${grp}")
+  railsctl_info "  Added user '${member}' to group '${grp}'."
+}
+
+init_provision_user_and_dirs() {
+  railsctl_status "Phase 2: Provisioning OS user, group, and directory skeleton..."
+
+  if getent group "${INIT_SERVICE_GROUP}" >/dev/null 2>&1; then
+    railsctl_info "  Using existing group '${INIT_SERVICE_GROUP}'."
+  else
+    sudo groupadd --system "${INIT_SERVICE_GROUP}"
+    CREATED_GROUP=true
+    railsctl_info "  Created system group '${INIT_SERVICE_GROUP}'."
+  fi
+
+  if id -u "${INIT_SERVICE_USER}" >/dev/null 2>&1; then
+    railsctl_info "  Using existing user '${INIT_SERVICE_USER}'."
+  else
+    sudo useradd \
+      --system \
+      --gid "${INIT_SERVICE_GROUP}" \
+      --home-dir "${INIT_SERVICE_HOME}" \
+      --shell /usr/sbin/nologin \
+      "${INIT_SERVICE_USER}"
+    CREATED_USER=true
+    railsctl_info "  Created system user '${INIT_SERVICE_USER}' (home: ${INIT_SERVICE_HOME})."
+  fi
+
+  init_add_user_to_group_if_missing "www-data" "${INIT_SERVICE_GROUP}"
+  init_add_user_to_group_if_missing "${USER}" "${INIT_SERVICE_GROUP}"
+  if getent group "rvm" >/dev/null 2>&1; then
+    init_add_user_to_group_if_missing "${INIT_SERVICE_USER}" "rvm"
+  fi
+
+  sudo install -d -o "${INIT_SERVICE_USER}" -g "${INIT_SERVICE_GROUP}" -m 0750 "${INIT_SERVICE_HOME}"
+  CREATED_HOME=true
+
+  sudo install -d -o "${INIT_SERVICE_USER}" -g "${INIT_SERVICE_GROUP}" -m 0755 "${INIT_SERVICE_HOME}/app"
+  sudo install -d -o "${INIT_SERVICE_USER}" -g "${INIT_SERVICE_GROUP}" -m 0750 "${INIT_SERVICE_HOME}/data"
+  sudo install -d -o "${INIT_SERVICE_USER}" -g "${INIT_SERVICE_GROUP}" -m 0700 "${INIT_SERVICE_HOME}/config"
+  sudo install -d -o "${INIT_SERVICE_USER}" -g "${INIT_SERVICE_GROUP}" -m 0750 "${INIT_SERVICE_HOME}/backups"
+
+  railsctl_info "  Created directory skeleton under ${INIT_SERVICE_HOME}."
+}
+
+init_verify_dir_spec() {
+  local dir_path="$1"
+  local expected_owner="$2"
+  local expected_group="$3"
+  local expected_mode="$4"
+
+  [[ -d "${dir_path}" ]] || railsctl_die "Validation failed: directory missing: ${dir_path}"
+
+  local actual_spec expected_spec
+  actual_spec="$(stat -c '%U:%G:%a' "${dir_path}")"
+  expected_spec="${expected_owner}:${expected_group}:${expected_mode}"
+
+  if [[ "${actual_spec}" != "${expected_spec}" ]]; then
+    railsctl_die "Validation failed on ${dir_path}: expected ${expected_spec}, got ${actual_spec}"
+  fi
+}
+
+init_validate_phase_2() {
+  getent group "${INIT_SERVICE_GROUP}" >/dev/null 2>&1 || railsctl_die "Validation failed: group '${INIT_SERVICE_GROUP}' not found."
+  id -u "${INIT_SERVICE_USER}" >/dev/null 2>&1        || railsctl_die "Validation failed: user '${INIT_SERVICE_USER}' not found."
+
+  id -nG "www-data" | tr ' ' '\n' | grep -Fxq "${INIT_SERVICE_GROUP}" \
+    || railsctl_die "Validation failed: 'www-data' not in group '${INIT_SERVICE_GROUP}'."
+  id -nG "${USER}" | tr ' ' '\n' | grep -Fxq "${INIT_SERVICE_GROUP}" \
+    || railsctl_die "Validation failed: '${USER}' not in group '${INIT_SERVICE_GROUP}'."
+
+  init_verify_dir_spec "${INIT_SERVICE_HOME}"         "${INIT_SERVICE_USER}" "${INIT_SERVICE_GROUP}" "750"
+  init_verify_dir_spec "${INIT_SERVICE_HOME}/app"     "${INIT_SERVICE_USER}" "${INIT_SERVICE_GROUP}" "755"
+  init_verify_dir_spec "${INIT_SERVICE_HOME}/data"    "${INIT_SERVICE_USER}" "${INIT_SERVICE_GROUP}" "750"
+  init_verify_dir_spec "${INIT_SERVICE_HOME}/config"  "${INIT_SERVICE_USER}" "${INIT_SERVICE_GROUP}" "700"
+  init_verify_dir_spec "${INIT_SERVICE_HOME}/backups" "${INIT_SERVICE_USER}" "${INIT_SERVICE_GROUP}" "750"
+
+  railsctl_info "  Phase 2 validation passed: user, group, memberships, and directory modes verified."
+}
+
+###############################################################################
 # Main entry point for INIT
 ###############################################################################
 init_main() {
@@ -334,7 +464,7 @@ init_main() {
 
   case ${preflight_rc} in
     0)
-      railsctl_info "Phase 1 complete: pre-flight dry-run passed and operator confirmed; ready for Phase 2."
+      railsctl_info "Phase 1 complete: pre-flight dry-run passed and operator confirmed."
       ;;
     10|11)
       return 0
@@ -343,6 +473,14 @@ init_main() {
       return "${preflight_rc}"
       ;;
   esac
+
+  ROLLBACK_ARMED=true
+
+  init_provision_user_and_dirs
+  init_validate_phase_2
+
+  ROLLBACK_ARMED=false
+  railsctl_info "Phase 2 complete: OS user, group, and directory skeleton verified; ready for Phase 3."
 }
 
 init_main "$@"
