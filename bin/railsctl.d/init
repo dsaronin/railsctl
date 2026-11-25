@@ -50,15 +50,13 @@ init_reset_variables() {
 ###############################################################################
 # Rollback scaffold & error trap
 ###############################################################################
-init_on_err() {
-  local err_line="$1"
-  local err_rc="$2"
+init_on_exit() {
+  local exit_rc="$1"
 
-  if [[ "${ROLLBACK_ARMED}" == "true" ]] && [[ "${ROLLBACK_IN_PROGRESS}" != "true" ]]; then
-    railsctl_err "Catastrophic error at line ${err_line} (exit ${err_rc}). Initiating clean rollback..."
+  if [[ ${exit_rc} -ne 0 ]] && [[ "${ROLLBACK_ARMED}" == "true" ]] && [[ "${ROLLBACK_IN_PROGRESS}" != "true" ]]; then
+    railsctl_err "Provisioning failed (exit ${exit_rc}). Initiating clean rollback..."
     init_rollback
   fi
-  exit "${err_rc}"
 }
 
 init_rollback_phase_2() {
@@ -90,6 +88,60 @@ init_rollback_phase_2() {
   fi
 }
 
+init_rollback_phase_4() {
+  local conf_file="${RAILSCTL_CONFIG_DIR}/${INIT_SERVICE_NAME}.conf"
+  local log_dir="${RAILSCTL_SERVICES_DIR}/${INIT_SERVICE_NAME}"
+
+  if [[ "${CREATED_LOG_DIR}" == "true" ]] && [[ -n "${INIT_SERVICE_NAME}" ]] && [[ -d "${log_dir}" ]]; then
+    railsctl_warn "  Rollback: removing audit log directory ${log_dir}..."
+    rm -rf "${log_dir}"
+    CREATED_LOG_DIR=false
+  fi
+
+  if [[ "${CREATED_CONF}" == "true" ]] && [[ -n "${INIT_SERVICE_NAME}" ]] && [[ -f "${conf_file}" ]]; then
+    railsctl_warn "  Rollback: removing service config ${conf_file}..."
+    rm -f "${conf_file}"
+    CREATED_CONF=false
+  fi
+}
+
+init_rollback_phase_5() {
+  local nginx_avail="/etc/nginx/sites-available/${INIT_SERVICE_NAME}.conf"
+  local nginx_enabled="/etc/nginx/sites-enabled/${INIT_SERVICE_NAME}.conf"
+  local unit_file="/etc/systemd/system/${INIT_UNIT_NAME}"
+  local nginx_changed=false
+
+  if [[ "${CREATED_NGINX_ENABLED}" == "true" ]] && [[ -L "${nginx_enabled}" || -e "${nginx_enabled}" ]]; then
+    railsctl_warn "  Rollback: removing Nginx enabled symlink ${nginx_enabled}..."
+    sudo rm -f "${nginx_enabled}"
+    CREATED_NGINX_ENABLED=false
+    nginx_changed=true
+  fi
+
+  if [[ "${CREATED_NGINX_AVAIL}" == "true" ]] && [[ -f "${nginx_avail}" ]]; then
+    railsctl_warn "  Rollback: removing Nginx site config ${nginx_avail}..."
+    sudo rm -f "${nginx_avail}"
+    CREATED_NGINX_AVAIL=false
+    nginx_changed=true
+  fi
+
+  if [[ "${nginx_changed}" == "true" ]]; then
+    if sudo nginx -t >/dev/null 2>&1; then
+      sudo systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if [[ "${CREATED_SYSTEMD}" == "true" ]] && [[ -f "${unit_file}" ]]; then
+    railsctl_warn "  Rollback: disabling and removing systemd unit ${unit_file}..."
+    sudo systemctl stop "${INIT_UNIT_NAME}" >/dev/null 2>&1 || true
+    sudo systemctl disable "${INIT_UNIT_NAME}" >/dev/null 2>&1 || true
+    sudo rm -f "${unit_file}"
+    sudo systemctl daemon-reload >/dev/null 2>&1 || true
+    sudo systemctl reset-failed >/dev/null 2>&1 || true
+    CREATED_SYSTEMD=false
+  fi
+}
+
 init_rollback() {
   ROLLBACK_IN_PROGRESS=true
   set +e
@@ -100,6 +152,8 @@ init_rollback() {
   #   2. Systemd (Phase 5)
   #   3. railsctl registration (Phase 4)
   #   4. Filesystem & OS user/group (Phase 2)
+  init_rollback_phase_5
+  init_rollback_phase_4
   init_rollback_phase_2
 
   railsctl_warn "Rollback complete."
@@ -416,10 +470,10 @@ init_verify_dir_spec() {
   local expected_group="$3"
   local expected_mode="$4"
 
-  [[ -d "${dir_path}" ]] || railsctl_die "Validation failed: directory missing: ${dir_path}"
+  sudo test -d "${dir_path}" || railsctl_die "Validation failed: directory missing: ${dir_path}"
 
   local actual_spec expected_spec
-  actual_spec="$(stat -c '%U:%G:%a' "${dir_path}")"
+  actual_spec="$(sudo stat -c '%U:%G:%a' "${dir_path}")"
   expected_spec="${expected_owner}:${expected_group}:${expected_mode}"
 
   if [[ "${actual_spec}" != "${expected_spec}" ]]; then
@@ -446,13 +500,209 @@ init_validate_phase_2() {
 }
 
 ###############################################################################
+# Phase 3: Repository clone, maintenance flag & environment file
+###############################################################################
+init_clone_repository() {
+  railsctl_info "  Cloning '${INIT_GIT_URL}' (branch '${INIT_GIT_BRANCH}') into ${INIT_SERVICE_HOME}/app..."
+  sudo -u "${INIT_SERVICE_USER}" git clone \
+    --branch "${INIT_GIT_BRANCH}" \
+    --single-branch \
+    "${INIT_GIT_URL}" \
+    "${INIT_SERVICE_HOME}/app"
+
+  sudo install -d -o "${INIT_SERVICE_USER}" -g "${INIT_SERVICE_GROUP}" -m 0775 "${INIT_SERVICE_HOME}/app/tmp"
+  sudo install -d -o "${INIT_SERVICE_USER}" -g "${INIT_SERVICE_GROUP}" -m 0775 "${INIT_SERVICE_HOME}/app/tmp/pids"
+
+  sudo -u "${INIT_SERVICE_USER}" touch "${INIT_SERVICE_HOME}/app/tmp/maintenance.flag"
+  sudo chmod 0644 "${INIT_SERVICE_HOME}/app/tmp/maintenance.flag"
+  railsctl_info "  Created tmp/pids and enabled maintenance.flag (HTTP 503 until first deploy)."
+}
+
+init_generate_env_file() {
+  local env_dest="${INIT_SERVICE_HOME}/config/${INIT_SERVICE_NAME}.env"
+  local tmp_env
+  tmp_env="$(mktemp)"
+
+  INIT_SECRET_KEY_BASE="$("${INIT_RUBY_WRAPPER_DIR}/ruby" -rsecurerandom -e 'puts SecureRandom.hex(64)')"
+  if [[ ${#INIT_SECRET_KEY_BASE} -ne 128 ]]; then
+    rm -f "${tmp_env}"
+    railsctl_die "Failed to generate 128-character SECRET_KEY_BASE."
+  fi
+
+  init_render_template "${RAILSCTL_TEMPLATES_DIR}/service.env.tmpl" "${tmp_env}"
+  sudo install -o "${INIT_SERVICE_USER}" -g "${INIT_SERVICE_GROUP}" -m 0600 "${tmp_env}" "${env_dest}"
+  rm -f "${tmp_env}"
+
+  railsctl_info "  Generated production environment file: ${env_dest} (mode 0600)."
+}
+
+init_provision_repo_and_env() {
+  railsctl_status "Phase 3: Cloning repository, setting maintenance flag, and generating environment file..."
+  init_clone_repository
+  init_generate_env_file
+}
+
+init_validate_phase_3() {
+  local app_dir="${INIT_SERVICE_HOME}/app"
+  local maint_flag="${app_dir}/tmp/maintenance.flag"
+  local env_dest="${INIT_SERVICE_HOME}/config/${INIT_SERVICE_NAME}.env"
+
+  sudo -u "${INIT_SERVICE_USER}" git -C "${app_dir}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || railsctl_die "Validation failed: ${app_dir} is not a valid Git working tree."
+
+  local current_branch
+  current_branch="$(sudo -u "${INIT_SERVICE_USER}" git -C "${app_dir}" rev-parse --abbrev-ref HEAD)"
+  if [[ "${current_branch}" != "${INIT_GIT_BRANCH}" ]]; then
+    railsctl_die "Validation failed: expected branch '${INIT_GIT_BRANCH}', got '${current_branch}'."
+  fi
+
+  sudo test -f "${maint_flag}" \
+    || railsctl_die "Validation failed: maintenance flag missing: ${maint_flag}"
+
+  sudo test -f "${env_dest}" \
+    || railsctl_die "Validation failed: environment file missing: ${env_dest}"
+
+  local actual_env_spec expected_env_spec
+  actual_env_spec="$(sudo stat -c '%U:%G:%a' "${env_dest}")"
+  expected_env_spec="${INIT_SERVICE_USER}:${INIT_SERVICE_GROUP}:600"
+  if [[ "${actual_env_spec}" != "${expected_env_spec}" ]]; then
+    railsctl_die "Validation failed on ${env_dest}: expected ${expected_env_spec}, got ${actual_env_spec}"
+  fi
+
+  sudo -u "${INIT_SERVICE_USER}" test -r "${env_dest}" \
+    || railsctl_die "Validation failed: ${env_dest} not readable by ${INIT_SERVICE_USER}."
+
+  if ! sudo grep -Eq '^SECRET_KEY_BASE=[0-9a-f]{128}$' "${env_dest}"; then
+    railsctl_die "Validation failed: invalid or missing SECRET_KEY_BASE in ${env_dest}."
+  fi
+
+  railsctl_info "  Phase 3 validation passed: Git branch, maintenance flag, and ${INIT_SERVICE_NAME}.env verified."
+}
+
+###############################################################################
+# Phase 4: railsctl configuration registration & audit logging
+###############################################################################
+init_provision_railsctl_registration() {
+  local conf_dest="${RAILSCTL_CONFIG_DIR}/${INIT_SERVICE_NAME}.conf"
+  local log_dir="${RAILSCTL_SERVICES_DIR}/${INIT_SERVICE_NAME}"
+
+  railsctl_status "Phase 4: Registering '${INIT_SERVICE_NAME}' in railsctl and initializing audit log..."
+
+  mkdir -p "${RAILSCTL_CONFIG_DIR}"
+  init_render_template "${RAILSCTL_TEMPLATES_DIR}/service.conf.tmpl" "${conf_dest}"
+  chmod 0644 "${conf_dest}"
+  CREATED_CONF=true
+  railsctl_info "  Created service configuration: ${conf_dest} (mode 0644)."
+
+  mkdir -p "${log_dir}"
+  CREATED_LOG_DIR=true
+
+  SERVICE_NAME="${INIT_SERVICE_NAME}"
+  railsctl_log "INIT" "service=${INIT_SERVICE_NAME} user=${INIT_SERVICE_USER} group=${INIT_SERVICE_GROUP} puma_port=${INIT_PUMA_PORT} nginx_port=${INIT_NGINX_PORT} repo=${INIT_GIT_URL} branch=${INIT_GIT_BRANCH}"
+  railsctl_info "  Initialized service audit log: ${log_dir}/railsctl.log"
+}
+
+init_validate_phase_4() {
+  local conf_dest="${RAILSCTL_CONFIG_DIR}/${INIT_SERVICE_NAME}.conf"
+  local log_file="${RAILSCTL_SERVICES_DIR}/${INIT_SERVICE_NAME}/railsctl.log"
+
+  [[ -f "${conf_dest}" ]] || railsctl_die "Validation failed: service config missing: ${conf_dest}"
+  bash -n "${conf_dest}"   || railsctl_die "Validation failed: syntax error in ${conf_dest}"
+
+  "${RAILSCTL_COMMANDS_DIR}/config" "${INIT_SERVICE_NAME}" >/dev/null \
+    || railsctl_die "Validation failed: 'railsctl config ${INIT_SERVICE_NAME}' exited non-zero."
+
+  [[ -f "${log_file}" ]] && [[ -w "${log_file}" ]] \
+    || railsctl_die "Validation failed: audit log missing or not writable: ${log_file}"
+
+  railsctl_info "  Phase 4 validation passed: ${INIT_SERVICE_NAME}.conf syntax, config resolution, and audit log verified."
+}
+
+###############################################################################
+# Phase 5: Systemd unit, Nginx reverse proxy & final handoff
+###############################################################################
+init_provision_systemd() {
+  local unit_dest="/etc/systemd/system/${INIT_UNIT_NAME}"
+  local tmp_unit
+  tmp_unit="$(mktemp)"
+
+  init_render_template "${RAILSCTL_TEMPLATES_DIR}/systemd.service.tmpl" "${tmp_unit}"
+  sudo install -o root -g root -m 0644 "${tmp_unit}" "${unit_dest}"
+  rm -f "${tmp_unit}"
+  CREATED_SYSTEMD=true
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable "${INIT_UNIT_NAME}" >/dev/null
+  railsctl_info "  Installed and enabled systemd unit: ${unit_dest} (kept stopped for initial deploy)."
+}
+
+init_provision_nginx() {
+  local nginx_avail="/etc/nginx/sites-available/${INIT_SERVICE_NAME}.conf"
+  local nginx_enabled="/etc/nginx/sites-enabled/${INIT_SERVICE_NAME}.conf"
+  local tmp_nginx
+  tmp_nginx="$(mktemp)"
+
+  init_render_template "${RAILSCTL_TEMPLATES_DIR}/nginx.conf.tmpl" "${tmp_nginx}"
+  sudo install -o root -g root -m 0644 "${tmp_nginx}" "${nginx_avail}"
+  rm -f "${tmp_nginx}"
+  CREATED_NGINX_AVAIL=true
+
+  sudo ln -s "${nginx_avail}" "${nginx_enabled}"
+  CREATED_NGINX_ENABLED=true
+
+  sudo nginx -t >/dev/null 2>&1 || railsctl_die "Nginx configuration test (nginx -t) failed for ${nginx_avail}."
+  sudo systemctl reload nginx
+  railsctl_info "  Installed, verified, and reloaded Nginx site: ${nginx_avail} (port ${INIT_NGINX_PORT})."
+}
+
+init_provision_runtime_and_proxy() {
+  railsctl_status "Phase 5: Provisioning systemd unit and Nginx reverse proxy..."
+  init_provision_systemd
+  init_provision_nginx
+}
+
+init_validate_phase_5() {
+  local unit_dest="/etc/systemd/system/${INIT_UNIT_NAME}"
+  local nginx_avail="/etc/nginx/sites-available/${INIT_SERVICE_NAME}.conf"
+  local nginx_enabled="/etc/nginx/sites-enabled/${INIT_SERVICE_NAME}.conf"
+
+  [[ "$(systemctl is-enabled "${INIT_UNIT_NAME}" 2>/dev/null || true)" == "enabled" ]] \
+    || railsctl_die "Validation failed: ${INIT_UNIT_NAME} is not enabled."
+
+  sudo systemd-analyze verify "${unit_dest}" >/dev/null 2>&1 \
+    || railsctl_die "Validation failed: systemd-analyze verify failed for ${unit_dest}."
+
+  [[ -L "${nginx_enabled}" ]] && [[ -f "${nginx_avail}" ]] \
+    || railsctl_die "Validation failed: Nginx site symlink or config missing for ${INIT_SERVICE_NAME}."
+
+  sudo nginx -t >/dev/null 2>&1 \
+    || railsctl_die "Validation failed: nginx -t reported errors."
+
+  local http_code
+  http_code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${INIT_NGINX_PORT}/" || true)"
+  if [[ "${http_code}" != "503" ]]; then
+    railsctl_die "Validation failed: expected HTTP 503 maintenance response on port ${INIT_NGINX_PORT}, got HTTP ${http_code}."
+  fi
+
+  railsctl_info "  Phase 5 validation passed: systemd unit enabled, Nginx verified, and port ${INIT_NGINX_PORT} serving HTTP 503."
+}
+
+init_print_handoff() {
+  railsctl_status "Provisioning complete for '${INIT_SERVICE_NAME}'."
+  railsctl_info "Next steps:"
+  railsctl_info "  1. Execute initial deployment (bundle, migrate, precompile, start & health check):"
+  railsctl_info "       railsctl ${INIT_SERVICE_NAME} deploy --redeploy --no-backup"
+  railsctl_info "  2. Configure UFW firewall rules if remote access is required for port ${INIT_NGINX_PORT}."
+}
+
+###############################################################################
 # Main entry point for INIT
 ###############################################################################
 init_main() {
   railsctl_load_global
   init_reset_variables
 
-  trap 'init_on_err "${LINENO}" "$?"' ERR
+  trap 'init_on_exit "$?"' EXIT
 
   init_parse_args "$@"
 
@@ -479,8 +729,18 @@ init_main() {
   init_provision_user_and_dirs
   init_validate_phase_2
 
+  init_provision_repo_and_env
+  init_validate_phase_3
+
+  init_provision_railsctl_registration
+  init_validate_phase_4
+
+  init_provision_runtime_and_proxy
+  init_validate_phase_5
+
   ROLLBACK_ARMED=false
-  railsctl_info "Phase 2 complete: OS user, group, and directory skeleton verified; ready for Phase 3."
+  railsctl_log "INIT" "status=COMPLETE service=${INIT_SERVICE_NAME} unit=${INIT_UNIT_NAME} nginx_port=${INIT_NGINX_PORT}"
+  init_print_handoff
 }
 
 init_main "$@"
