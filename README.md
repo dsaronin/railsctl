@@ -148,3 +148,57 @@ All `railsctl` executables, configurations, and operational logs reside strictly
 2. Codify `bin/railsctl.d/deploy` (reusing `backup` and shared health-check helpers) with fail-fast error handling (`set -euo pipefail`) and deployment logging under `$HOME/railsctl/services/gallery/`.
 3. **Exit Gate:** Push a test commit from `jabari` to `dsaronin/gallery` (`main`), execute `railsctl gallery deploy` on `uwanda`, and verify pre-deploy backup creation, code fast-forward, restart, log entry, and passing health check.
 4. Commit and push `railsctl` v1.0 to `git@github.com:dsaronin/railsctl.git`.
+
+## Service Provisioning (`railsctl init`)
+
+`railsctl init <service>` performs one-time, full-stack provisioning of a new Ruby on Rails service on the host using interactive prompts with sensible defaults. Provisioning stops once the service skeleton is in place and verified, leaving first-time dependency installation, database migration, asset precompilation, and startup to `railsctl <service> deploy`.
+
+```bash
+railsctl init <service> [--dry-run]
+```
+
+### Architectural Guarantees
+
+* **Dedicated Templates (`templates/`):** Configuration files (`service.conf.tmpl`, `service.env.tmpl`, `systemd.service.tmpl`, `nginx.conf.tmpl`) use `@@TOKEN@@` placeholders so Nginx variables (`$uri`, `$http_host`, `$scheme`) are never altered during rendering. * **Built-In Pre-Flight Dry-Run Gate:** Every invocation executes a read-only dry-run pass first—validating inputs, checking system/port collisions, testing Git remote reachability, and verifying template rendering—before requesting `y/N` confirmation. Passing `--dry-run` runs this identical pass, prints the planned actions, and exits `0` without modifying the system. * **Per-Phase Validation:** Every mutating phase (Phases 2–5) ends with a dedicated verification step (skipped under `--dry-run`). Any validation failure halts execution and triggers rollback. * **Clean Reverse-Order Rollback:** `init` tracks only artifacts created during the current invocation (`CREATED_GROUP`, `CREATED_USER`, `ADDED_GROUP_MEMBERS`, `CREATED_HOME`, `CREATED_CONF`, `CREATED_LOG_DIR`, `CREATED_SYSTEMD`, `CREATED_NGINX_AVAIL`, `CREATED_NGINX_ENABLED`). On catastrophic error or failed validation, rollback executes in strict reverse order (Nginx -> Systemd -> `railsctl` config/logs -> `/home/<service>` -> group memberships -> newly created user/group) without touching pre-existing shared resources.  ---  ### Provisioning Phases  #### Phase 1 — Validation, Interactive Prompting & Dry-Run Gate  * **Scope:** * Validate `<service>` naming syntax (`^[a-z][a-z0-9_-]*$`).
+  * Prompt interactively with defaults for Display Name, Git Repository URL (required), Git Branch (`main`), System User (`<service>`), System Group (`<service>`), Puma Port, Nginx Port, Ruby Wrapper Directory (`/usr/local/rvm/wrappers/ruby-3.3.11`), Version Constant, and Version File.
+  * Run pre-flight collision checks against `.config/<service>.conf`, `/home/<service>`, `/etc/systemd/system/<service>.service`, `/etc/nginx/sites-available/<service>.conf`, active sockets (`ss`), existing Nginx site ports, Ruby wrapper availability, and Git remote reachability (`git ls-remote`).
+  * Display the resolved summary and require `y/N` confirmation (or exit `0` if `--dry-run` is active).
+* **Validation:** Confirms all four templates exist and render into temporary buffers with zero unresolved `@@TOKEN@@` markers.
+
+#### Phase 2 — OS User, Group & Directory Skeleton
+
+* **Scope:**
+  * Create the system group if absent and create the system user (`--system --home-dir /home/<service> --shell /usr/sbin/nologin`).
+  * Add `www-data` and the invoking operator to `<service_group>`; add `<service_user>` to the `rvm` group.
+  * Provision `/home/<service>` (`0750`), `app` (`0755`), `data` (`0750`), `config` (`0700`), and `backups` (`0750`) with strict ownership.
+* **Validation:** Verifies user (`id`), group (`getent group`), group memberships, and exact directory ownership/octal modes (`stat`).
+* **Rollback:** Removes `/home/<service>`, strips group memberships added during the run, deletes `<service_user>`, and deletes `<service_group>` if newly created.
+
+#### Phase 3 — Repository Clone, Maintenance Flag & Environment File
+
+* **Scope:**
+  * Clone the Git repository into `/home/<service>/app` as `<service_user>` on the configured branch.
+  * Create `app/tmp/pids` (`0775`) and `app/tmp/maintenance.flag` so Nginx serves `HTTP 503` until the first `deploy` completes.
+  * Generate a 128-character hex `SECRET_KEY_BASE` via Ruby `SecureRandom` and render `/home/<service>/config/<service>.env` (`0600`) from `service.env.tmpl`.
+* **Validation:** Verifies a valid Git worktree on the target branch, presence of `maintenance.flag`, `<service>.env` mode `0600` readable by `<service_user>`, and a non-empty `SECRET_KEY_BASE`.
+* **Rollback:** Reverted cleanly via Phase 2 `/home/<service>` removal.
+
+#### Phase 4 — `railsctl` Configuration Registration & Audit Logging
+
+* **Scope:**
+  * Render `.config/<service>.conf` (`0644`) from `service.conf.tmpl`.
+  * Create `services/<service>/` and record `INIT` entries in `services/<service>/railsctl.log`.
+* **Validation:** Runs `bash -n` on `.config/<service>.conf`, confirms `railsctl config <service>` exits `0`, and confirms `railsctl.log` is writable.
+* **Rollback:** Removes `.config/<service>.conf` and `services/<service>/`.
+
+#### Phase 5 — Systemd Unit, Nginx Reverse Proxy & Handoff
+
+* **Scope:**
+  * Render `/etc/systemd/system/<service>.service` (`0644`), run `systemctl daemon-reload`, and enable `<service>.service` (leaving the unit stopped for the first `deploy`).
+  * Render `/etc/nginx/sites-available/<service>.conf` (`0644`), symlink into `/etc/nginx/sites-enabled/<service>.conf`, test with `nginx -t`, and reload Nginx.
+  * Print post-init handoff instructions:
+    1. Run `railsctl <service> deploy --redeploy --no-backup` to execute first-time `bundle install`, `db:migrate`, `assets:precompile`, service start, and health verification.
+    2. Configure any required UFW firewall rules for `<nginx_port>`.
+* **Validation:** Verifies `systemctl is-enabled <service>.service`, `systemd-analyze verify`, `nginx -t`, and confirms `http://127.0.0.1:<nginx_port>/` returns `HTTP 503`.
+* **Rollback:** Removes the Nginx symlink and vhost, tests (`nginx -t`) and reloads Nginx; disables and removes the systemd unit and runs `systemctl daemon-reload`; then cascades through Phases 4, 3, and 2 rollback.
+
