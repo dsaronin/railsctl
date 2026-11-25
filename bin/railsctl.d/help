@@ -12,6 +12,7 @@ railsctl_load_global
 SERVICES_LIST="$(railsctl_list_services | paste -sd ', ' -)"
 
 railsctl_status "Usage:"
+railsctl_info   "  railsctl init <service> [--dry-run]"
 railsctl_info   "  railsctl <service> <command> [options]"
 railsctl_info   "  railsctl config [service]"
 railsctl_info   "  railsctl help"
@@ -21,18 +22,18 @@ railsctl_status "Configured Services:"
 railsctl_info   "  ${SERVICES_LIST:-none}"
 echo
 
-railsctl_status "Lifecycle & Deployment Commands:"
+railsctl_status "<service> Deployment Commands:"
 cat <<'EOF'
-  deploy    Suspend, backup DB, pull fast-forward, bundle, migrate, precompile, resume & status 
-            [--dry-run] [--redeploy] [--no-backup]
-  start     Start the systemd unit and verify the HTTP health check
-  stop      Cleanly stop the systemd unit
-  suspend   Enable Nginx 503 maintenance mode and stop Puma
-  resume    Start Puma, verify HTTP health check, and clear maintenance mode
-  backup    Create a WAL-safe online SQLite backup and prune older snapshots
+  init      Provision a new <service>  [--dry-run]
+  deploy    Safely deploy new version of a <service> [--dry-run] [--redeploy] [--no-backup]
+  start     Start the <service> and verify
+  stop      Cleanly stop the <service>
+  suspend   Enable Nginx 503 maintenance mode and stop <service>
+  resume    Start <service>, verify 
+  backup    Backup SQLite; prune older snapshots
   test      Run the isolated test suite against a temporary snapshot database
-  status    Display systemd state, PID, memory, uptime, Git commit, and app version
-  version   Display railsctl version, service app version constant, and Git SHA
-  config    Display resolved configuration parameters for <service> or global railsctl
-  help      Show this help message
+  status    Display <service> state and stats
+  version   Display railsctl version, <service> version, and Git SHA
+  config    Display configuration parameters for <service> or global railsctl
+  help      This message
 EOF

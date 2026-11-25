@@ -15,7 +15,7 @@ railsctl_load_global
 
 railsctl_alert "railsctl v${RAILSCTL_VERSION} — starting"
 
-VALID_COMMANDS=(deploy start stop suspend resume backup test status version config help)
+VALID_COMMANDS=(init deploy start stop suspend resume backup test status version config help)
 
 normalize_cmd() {
   local raw="${1,,}"

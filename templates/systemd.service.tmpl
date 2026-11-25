@@ -1,0 +1,20 @@
+[Unit]
+Description=@@SERVICE_DISPLAY_NAME@@ Ruby on Rails Application Server (Puma)
+After=network.target
+
+[Service]
+Type=simple
+User=@@SERVICE_USER@@
+Group=@@SERVICE_GROUP@@
+WorkingDirectory=@@SERVICE_HOME@@/app
+EnvironmentFile=@@SERVICE_HOME@@/config/@@SERVICE_NAME@@.env
+ExecStart=@@RUBY_WRAPPER_DIR@@/bundle exec puma -C @@SERVICE_HOME@@/app/config/puma.rb
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=@@SERVICE_NAME@@
+
+[Install]
+WantedBy=multi-user.target

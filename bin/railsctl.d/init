@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+# bin/railsctl.d/init
+# Phase 1: Interactive prompting, pre-flight dry-run gate, template validation & rollback scaffold
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_common.sh"
+
+###############################################################################
+# State initialization
+###############################################################################
+init_reset_variables() {
+  OPT_DRY_RUN=false
+
+  RAILSCTL_TEMPLATES_DIR="${RAILSCTL_ROOT}/templates"
+
+  INIT_SERVICE_NAME=""
+  INIT_DISPLAY_NAME=""
+  INIT_GIT_URL=""
+  INIT_GIT_BRANCH="main"
+  INIT_SERVICE_USER=""
+  INIT_SERVICE_GROUP=""
+  INIT_UNIT_NAME=""
+  INIT_SERVICE_HOME=""
+  INIT_PUMA_PORT=""
+  INIT_NGINX_PORT=""
+  INIT_NGINX_ID=""
+  INIT_HOSTNAME=""
+  INIT_RUBY_WRAPPER_DIR="/usr/local/rvm/wrappers/ruby-3.3.11"
+  INIT_VERSION_CONST=""
+  INIT_VERSION_FILE_REL=""
+  INIT_SECRET_KEY_BASE=""
+
+  # Rollback state trackers (mutated only in Phases 2-5)
+  ROLLBACK_ARMED=false
+  ROLLBACK_IN_PROGRESS=false
+  CREATED_GROUP=false
+  CREATED_USER=false
+  ADDED_GROUP_MEMBERS=()
+  CREATED_HOME=false
+  CREATED_CONF=false
+  CREATED_LOG_DIR=false
+  CREATED_SYSTEMD=false
+  CREATED_NGINX_AVAIL=false
+  CREATED_NGINX_ENABLED=false
+}
+
+###############################################################################
+# Rollback scaffold & error trap
+###############################################################################
+init_on_err() {
+  local err_line="$1"
+  local err_rc="$2"
+
+  if [[ "${ROLLBACK_ARMED}" == "true" ]] && [[ "${ROLLBACK_IN_PROGRESS}" != "true" ]]; then
+    railsctl_err "Catastrophic error at line ${err_line} (exit ${err_rc}). Initiating clean rollback..."
+    init_rollback
+  fi
+  exit "${err_rc}"
+}
+
+init_rollback() {
+  ROLLBACK_IN_PROGRESS=true
+  set +e
+
+  railsctl_warn "Rollback: reverting artifacts created during this init run..."
+  # Reverse-order teardown steps will be populated in Phases 2-5:
+  #   1. Nginx (CREATED_NGINX_ENABLED, CREATED_NGINX_AVAIL)
+  #   2. Systemd (CREATED_SYSTEMD)
+  #   3. railsctl registration (CREATED_CONF, CREATED_LOG_DIR)
+  #   4. Filesystem & OS user/group (CREATED_HOME, ADDED_GROUP_MEMBERS, CREATED_USER, CREATED_GROUP)
+
+  railsctl_warn "Rollback complete."
+  ROLLBACK_ARMED=false
+  ROLLBACK_IN_PROGRESS=false
+}
+
+###############################################################################
+# Argument parsing & interactive prompting helpers
+###############################################################################
+init_parse_args() {
+  if [[ $# -lt 1 ]]; then
+    railsctl_die "Usage: railsctl init <service> [--dry-run]"
+  fi
+
+  INIT_SERVICE_NAME="${1,,}"
+  shift 1
+
+  railsctl_parse_args --dry-run -- "$@"
+
+  railsctl_info "Init target: service='${INIT_SERVICE_NAME}', dry-run=${OPT_DRY_RUN}"
+}
+
+init_prompt_value() {
+  local var_name="$1"
+  local label="$2"
+  local default_val="$3"
+  local required="${4:-false}"
+  local input_val=""
+
+  while true; do
+    if [[ -n "${default_val}" ]]; then
+      read -r -p "  ${label} [${default_val}]: " input_val
+      input_val="${input_val:-${default_val}}"
+    else
+      read -r -p "  ${label}: " input_val
+    fi
+
+    if [[ "${required}" == "true" ]] && [[ -z "${input_val}" ]]; then
+      railsctl_warn "  A value is required for '${label}'."
+      continue
+    fi
+
+    printf -v "${var_name}" '%s' "${input_val}"
+    break
+  done
+}
+
+init_prompt_parameters() {
+  local default_display="${INIT_SERVICE_NAME^^}"
+  local default_const_prefix="${INIT_SERVICE_NAME//-/ }"
+  local default_const=""
+  local word
+  for word in ${default_const_prefix}; do
+    default_const+="${word^}"
+  done
+  default_const="${default_const}::VERSION"
+
+  railsctl_status "Phase 1: Collecting provisioning parameters for '${INIT_SERVICE_NAME}'..."
+
+  init_prompt_value INIT_DISPLAY_NAME     "Display Name"      "${default_display}" true
+  init_prompt_value INIT_GIT_URL          "Git Repo URL"      ""                   true
+  init_prompt_value INIT_GIT_BRANCH       "Git Branch"        "main"               true
+  init_prompt_value INIT_SERVICE_USER     "System User"       "${INIT_SERVICE_NAME}" true
+  init_prompt_value INIT_SERVICE_GROUP    "System Group"      "${INIT_SERVICE_NAME}" true
+  init_prompt_value INIT_PUMA_PORT        "Puma Port"         "9001"               true
+  init_prompt_value INIT_NGINX_PORT       "Nginx Port"        "9011"               true
+  init_prompt_value INIT_RUBY_WRAPPER_DIR "Ruby Wrapper Dir"  "${INIT_RUBY_WRAPPER_DIR}" true
+  init_prompt_value INIT_VERSION_CONST    "Version Constant"  "${default_const}"   true
+  init_prompt_value INIT_VERSION_FILE_REL "Version File (rel)" "lib/${INIT_SERVICE_NAME}/version.rb" true
+
+  INIT_UNIT_NAME="${INIT_SERVICE_NAME}.service"
+  INIT_SERVICE_HOME="/home/${INIT_SERVICE_NAME}"
+  INIT_NGINX_ID="${INIT_SERVICE_NAME//-/_}"
+  INIT_HOSTNAME="$(hostname -s)"
+}
+
+###############################################################################
+# Phase 1 pre-flight & dry-run validation helpers
+###############################################################################
+init_check_service_name() {
+  if [[ ! "${INIT_SERVICE_NAME}" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    railsctl_die "Invalid service name '${INIT_SERVICE_NAME}'. Must match ^[a-z][a-z0-9_-]*$"
+  fi
+  INIT_UNIT_NAME="${INIT_SERVICE_NAME}.service"
+  INIT_SERVICE_HOME="/home/${INIT_SERVICE_NAME}"
+  railsctl_info "  Verified service name syntax: ${INIT_SERVICE_NAME}"
+}
+
+init_check_no_collisions() {
+  local conf_file="${RAILSCTL_CONFIG_DIR}/${INIT_SERVICE_NAME}.conf"
+  local unit_file="/etc/systemd/system/${INIT_UNIT_NAME}"
+  local nginx_avail="/etc/nginx/sites-available/${INIT_SERVICE_NAME}.conf"
+  local nginx_enabled="/etc/nginx/sites-enabled/${INIT_SERVICE_NAME}.conf"
+
+  [[ ! -e "${conf_file}" ]]     || railsctl_die "Service config already exists: ${conf_file}"
+  [[ ! -e "${INIT_SERVICE_HOME}" ]] || railsctl_die "Service home already exists: ${INIT_SERVICE_HOME}"
+  [[ ! -e "${unit_file}" ]]     || railsctl_die "Systemd unit already exists: ${unit_file}"
+  [[ ! -e "${nginx_avail}" ]]   || railsctl_die "Nginx site already exists: ${nginx_avail}"
+  [[ ! -e "${nginx_enabled}" ]] || railsctl_die "Nginx site symlink already exists: ${nginx_enabled}"
+
+  railsctl_info "  Verified no existing config, home, systemd, or Nginx collisions."
+}
+
+init_validate_port_value() {
+  local label="$1"
+  local port="$2"
+
+  if [[ ! "${port}" =~ ^[0-9]+$ ]] || (( port < 1024 || port > 65535 )); then
+    railsctl_die "Invalid ${label} '${port}'. Must be an integer between 1024 and 65535."
+  fi
+
+  if ss -H -ltn | grep -Eq "[:.]${port}[[:space:]]"; then
+    railsctl_die "${label} ${port} is currently bound by a listening socket."
+  fi
+
+  if compgen -G "/etc/nginx/sites-available/*.conf" >/dev/null; then
+    if grep -Eq "(listen[[:space:]]+${port};|127\.0\.0\.1:${port}\b)" /etc/nginx/sites-available/*.conf; then
+      railsctl_die "${label} ${port} is already referenced in /etc/nginx/sites-available/*.conf."
+    fi
+  fi
+}
+
+init_check_ports() {
+  if [[ "${INIT_PUMA_PORT}" == "${INIT_NGINX_PORT}" ]]; then
+    railsctl_die "Puma port (${INIT_PUMA_PORT}) and Nginx port (${INIT_NGINX_PORT}) must differ."
+  fi
+
+  init_validate_port_value "Puma port"  "${INIT_PUMA_PORT}"
+  init_validate_port_value "Nginx port" "${INIT_NGINX_PORT}"
+  railsctl_info "  Verified ports available: Puma=${INIT_PUMA_PORT}, Nginx=${INIT_NGINX_PORT}"
+}
+
+init_check_runtime_and_git() {
+  [[ -x "${INIT_RUBY_WRAPPER_DIR}/ruby" ]]   || railsctl_die "Ruby binary not executable: ${INIT_RUBY_WRAPPER_DIR}/ruby"
+  [[ -x "${INIT_RUBY_WRAPPER_DIR}/bundle" ]] || railsctl_die "Bundler binary not executable: ${INIT_RUBY_WRAPPER_DIR}/bundle"
+  railsctl_info "  Verified Ruby wrapper dir: ${INIT_RUBY_WRAPPER_DIR}"
+
+  railsctl_info "  Checking Git remote reachability (${INIT_GIT_URL}, branch '${INIT_GIT_BRANCH}')..."
+  local remote_ref
+  remote_ref="$(git ls-remote --heads "${INIT_GIT_URL}" "${INIT_GIT_BRANCH}" 2>/dev/null || true)"
+  if [[ -z "${remote_ref}" ]]; then
+    railsctl_die "Unable to resolve branch '${INIT_GIT_BRANCH}' on Git remote: ${INIT_GIT_URL}"
+  fi
+  railsctl_info "  Verified Git remote branch '${INIT_GIT_BRANCH}' reachable."
+}
+
+init_render_template() {
+  local tmpl_path="$1"
+  local dest_path="$2"
+  local secret_val="${INIT_SECRET_KEY_BASE:-DRY_RUN_PLACEHOLDER}"
+
+  sed \
+    -e "s|@@SERVICE_NAME@@|${INIT_SERVICE_NAME}|g" \
+    -e "s|@@SERVICE_DISPLAY_NAME@@|${INIT_DISPLAY_NAME}|g" \
+    -e "s|@@SERVICE_USER@@|${INIT_SERVICE_USER}|g" \
+    -e "s|@@SERVICE_GROUP@@|${INIT_SERVICE_GROUP}|g" \
+    -e "s|@@UNIT_NAME@@|${INIT_UNIT_NAME}|g" \
+    -e "s|@@SERVICE_HOME@@|${INIT_SERVICE_HOME}|g" \
+    -e "s|@@GIT_BRANCH@@|${INIT_GIT_BRANCH}|g" \
+    -e "s|@@RUBY_WRAPPER_DIR@@|${INIT_RUBY_WRAPPER_DIR}|g" \
+    -e "s|@@VERSION_CONST@@|${INIT_VERSION_CONST}|g" \
+    -e "s|@@VERSION_FILE_REL@@|${INIT_VERSION_FILE_REL}|g" \
+    -e "s|@@PUMA_PORT@@|${INIT_PUMA_PORT}|g" \
+    -e "s|@@NGINX_PORT@@|${INIT_NGINX_PORT}|g" \
+    -e "s|@@NGINX_ID@@|${INIT_NGINX_ID}|g" \
+    -e "s|@@HOSTNAME@@|${INIT_HOSTNAME}|g" \
+    -e "s|@@SECRET_KEY_BASE@@|${secret_val}|g" \
+    "${tmpl_path}" > "${dest_path}"
+}
+
+init_validate_phase_1() {
+  local templates=(service.conf.tmpl service.env.tmpl systemd.service.tmpl nginx.conf.tmpl)
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+
+  local tmpl src out
+  for tmpl in "${templates[@]}"; do
+    src="${RAILSCTL_TEMPLATES_DIR}/${tmpl}"
+    if [[ ! -r "${src}" ]]; then
+      rm -rf "${tmp_dir}"
+      railsctl_die "Missing or unreadable template: ${src}"
+    fi
+
+    out="${tmp_dir}/${tmpl%.tmpl}"
+    init_render_template "${src}" "${out}"
+
+    if grep -Eq '@@[A-Z0-9_]+@@' "${out}"; then
+      railsctl_err "Unresolved placeholder tokens found in rendered ${tmpl}:"
+      railsctl_err "$(grep -En '@@[A-Z0-9_]+@@' "${out}")"
+      rm -rf "${tmp_dir}"
+      railsctl_die "Template validation failed for ${tmpl}."
+    fi
+  done
+
+  rm -rf "${tmp_dir}"
+  railsctl_info "  Validated all 4 templates render cleanly with zero unresolved tokens."
+}
+
+init_print_summary() {
+  railsctl_status "Dry-Run Pre-Flight Summary for '${INIT_SERVICE_NAME}':"
+  railsctl_info "  Display Name     : ${INIT_DISPLAY_NAME}"
+  railsctl_info "  Git Repository   : ${INIT_GIT_URL} (branch: ${INIT_GIT_BRANCH})"
+  railsctl_info "  System User/Group: ${INIT_SERVICE_USER}:${INIT_SERVICE_GROUP}"
+  railsctl_info "  Service Home     : ${INIT_SERVICE_HOME}"
+  railsctl_info "  Puma Bind        : http://127.0.0.1:${INIT_PUMA_PORT}"
+  railsctl_info "  Nginx Listen     : port ${INIT_NGINX_PORT} (/etc/nginx/sites-available/${INIT_SERVICE_NAME}.conf)"
+  railsctl_info "  Systemd Unit     : /etc/systemd/system/${INIT_UNIT_NAME}"
+  railsctl_info "  railsctl Config  : ${RAILSCTL_CONFIG_DIR}/${INIT_SERVICE_NAME}.conf"
+  railsctl_info "  Ruby Wrapper     : ${INIT_RUBY_WRAPPER_DIR}"
+  railsctl_info "  Version Tracking : ${INIT_VERSION_CONST} (${INIT_VERSION_FILE_REL})"
+}
+
+init_confirm_proceed() {
+  if [[ "${OPT_DRY_RUN}" == "true" ]]; then
+    railsctl_status "Dry-run complete: all pre-flight checks and template validations passed. No changes applied."
+    return 10
+  fi
+
+  local answer=""
+  read -r -p "Proceed with provisioning '${INIT_SERVICE_NAME}'? [y/N]: " answer
+  case "${answer}" in
+    y|Y|yes|YES)
+      return 0
+      ;;
+    *)
+      railsctl_warn "Provisioning cancelled by operator. No changes applied."
+      return 11
+      ;;
+  esac
+}
+
+init_preflight() {
+  init_check_service_name
+  init_check_no_collisions
+  init_prompt_parameters
+
+  railsctl_status "Phase 1: Running built-in dry-run pre-flight checks..."
+  init_check_ports
+  init_check_runtime_and_git
+  init_validate_phase_1
+  init_print_summary
+  init_confirm_proceed
+}
+
+###############################################################################
+# Main entry point for INIT
+###############################################################################
+init_main() {
+  railsctl_load_global
+  init_reset_variables
+
+  trap 'init_on_err "${LINENO}" "$?"' ERR
+
+  init_parse_args "$@"
+
+  local preflight_rc=0
+  set +e
+  init_preflight
+  preflight_rc=$?
+  set -e
+
+  case ${preflight_rc} in
+    0)
+      railsctl_info "Phase 1 complete: pre-flight dry-run passed and operator confirmed; ready for Phase 2."
+      ;;
+    10|11)
+      return 0
+      ;;
+    *)
+      return "${preflight_rc}"
+      ;;
+  esac
+}
+
+init_main "$@"

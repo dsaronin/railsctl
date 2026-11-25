@@ -1,0 +1,52 @@
+upstream @@NGINX_ID@@_puma {
+  server 127.0.0.1:@@PUMA_PORT@@ fail_timeout=0;
+}
+
+server {
+  listen @@NGINX_PORT@@;
+  server_name @@HOSTNAME@@ @@HOSTNAME@@.local localhost 127.0.0.1 _;
+
+  root @@SERVICE_HOME@@/app/public;
+  client_max_body_size 50M;
+
+  access_log /var/log/nginx/@@SERVICE_NAME@@.access.log;
+  error_log  /var/log/nginx/@@SERVICE_NAME@@.error.log;
+
+  if (-f @@SERVICE_HOME@@/app/tmp/maintenance.flag) {
+    return 503;
+  }
+
+  error_page 503 @maintenance;
+
+  location ^~ /assets/ {
+    gzip_static on;
+    expires max;
+    add_header Cache-Control "public, immutable";
+  }
+
+  location / {
+    try_files $uri @@@NGINX_ID@@_app;
+  }
+
+  location @@@NGINX_ID@@_app {
+    proxy_pass http://@@NGINX_ID@@_puma;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 120s;
+  }
+
+  location @maintenance {
+    root @@SERVICE_HOME@@/app/public;
+    add_header Retry-After 300 always;
+    try_files /maintenance.html @maintenance_fallback;
+  }
+
+  location @maintenance_fallback {
+    default_type text/plain;
+    add_header Retry-After 300 always;
+    return 503 "Service temporarily unavailable for maintenance.\n";
+  }
+}

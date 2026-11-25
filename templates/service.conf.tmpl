@@ -1,0 +1,44 @@
+# .config/@@SERVICE_NAME@@.conf
+# Service-specific configuration for @@SERVICE_DISPLAY_NAME@@
+
+SERVICE_NAME="@@SERVICE_NAME@@"
+SERVICE_DISPLAY_NAME="@@SERVICE_DISPLAY_NAME@@"
+
+# System user, group, and systemd unit
+SERVICE_USER="@@SERVICE_USER@@"
+SERVICE_GROUP="@@SERVICE_GROUP@@"
+UNIT_NAME="@@UNIT_NAME@@"
+
+# Application filesystem paths
+SERVICE_HOME="@@SERVICE_HOME@@"
+APP_DIR="${SERVICE_HOME}/app"
+PUBLIC_DIR="${APP_DIR}/public"
+ENV_FILE="${SERVICE_HOME}/config/@@SERVICE_NAME@@.env"
+DB_PATH="${SERVICE_HOME}/data/production.sqlite3"
+BACKUP_DIR="${SERVICE_HOME}/backups"
+BACKUP_PREFIX="production"
+BACKUP_RETENTION=10
+
+# Git & Ruby runtime
+GIT_REMOTE="origin"
+GIT_BRANCH="@@GIT_BRANCH@@"
+RUBY_WRAPPER_DIR="@@RUBY_WRAPPER_DIR@@"
+BUNDLE_WITHOUT="development test"
+BUNDLE_JOBS=4
+VERSION_CONST="@@VERSION_CONST@@"
+VERSION_FILE="${APP_DIR}/@@VERSION_FILE_REL@@"
+
+# HTTP health check & Nginx maintenance mode
+BIND_URL="http://127.0.0.1:@@PUMA_PORT@@"
+HEALTH_PATH="/up"
+HEALTH_EXPECTED_CODE="200"
+HEALTH_TIMEOUT=15
+HEALTH_INTERVAL=1
+NGINX_SITE_CONF="/etc/nginx/sites-available/@@SERVICE_NAME@@.conf"
+MAINTENANCE_FLAG="${APP_DIR}/tmp/maintenance.flag"
+MAINTENANCE_HTML="${PUBLIC_DIR}/maintenance.html"
+
+# Isolated test suite runner
+TEST_FIXTURE_DB="${BACKUP_DIR}/test_fixture.sqlite3"
+TEST_TEMP_DB="/tmp/@@SERVICE_NAME@@_suite_test.sqlite3"
+TEST_RUNNER="./script/run_all_tests.sh"
